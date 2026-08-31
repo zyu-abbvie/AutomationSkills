@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace-manifest.json",
+  "name": "automation-engineering-marketplace",
+  "description": "Shared Claude Code plugins for lab automation engineering: Ignition, Node-RED, MQTT and SQL.",
+  "owner": {
+    "name": "Lab Automation Engineering"
+  },
+  "metadata": {
+    "pluginRoot": "./plugins/"
+  },
+  "plugins": [
+    {
+      "name": "automation-engineering",
+      "source": "./plugins/automation-engineering",
+      "description": "Reference and toolkit for building, editing, interacting with and troubleshooting this estate's Ignition and Node-RED automation projects, plus the MQTT and SQL layers between them.",
+      "version": "1.0.0",
+      "category": "engineering",
+      "keywords": [
+        "ignition",
+        "node-red",
+        "mqtt",
+        "sql",
+        "automation"
+      ]
+    }
+  ]
+}

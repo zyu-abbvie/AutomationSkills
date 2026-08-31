@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""ign - talk to an Ignition 8.3 Gateway over its HTTP API. Zero dependencies (stdlib only).
+
+Capability tiers in this estate (verified 2026-08-28 against 8.3.7):
+  * DEV gateway exposes /data/api/v1/**. Reads are ANONYMOUS (200). Writes return 401.
+  * PROD gateway does NOT expose the API at all (404 on /openapi and every /data/api/v1 route).
+    Prod is Designer-and-backup-files only. This tool refuses to send writes to a prod host.
+
+Configuration comes from, highest precedence first: a flag, an environment variable, the local
+config file (automation.local.yaml - see `ign config`), then a built-in default.
+
+  --url / IGN_URL          base URL, e.g. http://wa03593d:8088   (default: the dev gateway)
+  --token / IGN_API_TOKEN  API token for writes, sent as X-Ignition-API-Token
+  IGN_PROD_HOSTS           comma-separated hostnames treated as production (default: wz02163d)
+  --env dev|prod           which section of the config file to read (default: $AUTOMATION_ENV or dev)
+
+Run `ign capabilities` first when you land in an unfamiliar environment. It tells you which
+tier you are on, so you do not spend three tool calls discovering that writes need auth.
+Run `ign config` to see where each setting came from, with secrets masked.
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+import _config  # noqa: E402  (shared module in ../lib, kept out of bin/ because bin/ is on PATH)
+
+TOKEN_HEADER = "X-Ignition-API-Token"
+SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+
+
+def die(msg, code=1):
+    sys.stderr.write("ign: %s\n" % msg)
+    sys.exit(code)
+
+
+class Gateway(object):
+    def __init__(self, url=None, token=None, env=None, config_path=None, timeout=30):
+        cfg, self.why, self.config_path = _config.load(
+            env=env, config_path=config_path,
+            overrides={"gateway_url": url, "api_token": token})
+        self.base = cfg["gateway_url"].rstrip("/")
+        self.token = cfg["api_token"]
+        self.prod_hosts = set(h.strip().lower()
+                              for h in cfg["prod_hosts"].split(",") if h.strip())
+        self.timeout = timeout
+
+    @property
+    def host(self):
+        return (urllib.parse.urlparse(self.base).hostname or "").lower()
+
+    @property
+    def is_prod(self):
+        return self.host in self.prod_hosts
+
+    def request(self, method, path, body=None, raw=False, allow_write=False):
+        method = method.upper()
+        if method not in SAFE_METHODS:
+            if self.is_prod:
+                die("refusing %s against production host %r.\n"
+                    "     Prod has no HTTP API in this estate; author prod changes in the Designer.\n"
+                    "     If this host is genuinely not prod, unset it from IGN_PROD_HOSTS."
+                    % (method, self.host), 3)
+            if not allow_write:
+                die("%s is a write. Re-run with --confirm to send it." % method, 3)
+
+        url = self.base + path
+        data = None
+        headers = {"Accept": "application/json"}
+        if body is not None:
+            data = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if self.token:
+            headers[TOKEN_HEADER] = self.token
+
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                payload = r.read()
+                return r.status, payload if raw else self._decode(payload)
+        except urllib.error.HTTPError as e:
+            payload = e.read()
+            return e.code, payload if raw else self._decode(payload)
+        except urllib.error.URLError as e:
+            die("cannot reach %s (%s)" % (url, e.reason), 4)
+
+    @staticmethod
+    def _decode(payload):
+        if not payload:
+            return None
+        try:
+            return json.loads(payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return payload.decode("utf-8", "replace")
+
+    def get(self, path):
+        status, body = self.request("GET", path)
+        if status != 200:
+            die("GET %s -> HTTP %s\n%s" % (path, status, _pretty(body)), 5)
+        return body
+
+    def probe(self, method, path):
+        """Status code only. Never raises, never sends a body."""
+        url = self.base + path
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers[TOKEN_HEADER] = self.token
+        req = urllib.request.Request(url, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except urllib.error.URLError:
+            return 0
+
+
+def _pretty(obj):
+    if isinstance(obj, (dict, list)):
+        return json.dumps(obj, indent=2, sort_keys=False)
+    return str(obj) if obj is not None else ""
+
+
+def _items(body):
+    """Unwrap the {"items": [...], "metadata": {...}} envelope the API uses for collections."""
+    if isinstance(body, dict) and "items" in body:
+        return body["items"]
+    return body
+
+
+# --------------------------------------------------------------------------- commands
+
+def cmd_capabilities(gw, args):
+    """Fingerprint the gateway: which tier am I on, and what can I actually do?"""
+    out = {"url": gw.base, "host": gw.host,
+           "classified_as": "production" if gw.is_prod else "non-production",
+           "token_present": bool(gw.token)}
+
+    # /system/gwinfo is plain text, unauthenticated, and present on 8.1 AND 8.3 - unlike
+    # /data/api/v1/gateway-info, which only exists from 8.3. Probe it first so this command
+    # still identifies a gateway that has no REST API at all.
+    status, text = gw.request("GET", "/system/gwinfo")
+    if status == 200 and isinstance(text, str):
+        info = dict(kv.split("=", 1) for kv in text.strip().rstrip(";").split(";") if "=" in kv)
+        for src, dst in (("PlatformName", "name"), ("Version", "version"), ("OS", "os"),
+                         ("RuntimeVersion", "jvm"), ("ContextStatus", "status"),
+                         ("RedundancyStatus", "redundancy")):
+            if info.get(src):
+                out[dst] = info[src]
+        ver = info.get("Version", "")
+        out["api_expected"] = "yes (8.3+)" if ver[:3] >= "8.3" else "no (pre-8.3)"
+
+    api = gw.probe("GET", "/data/api/v1/gateway-info")
+    out["http_api"] = "absent (%s)" % api if api != 200 else "present"
+    if api == 200:
+        info = gw.get("/data/api/v1/gateway-info")
+        for k in ("ignitionVersion", "edition", "timeZoneId", "deploymentMode"):
+            if k in info:
+                out[k] = info[k]
+        out["reads_anonymous"] = not gw.token
+        # A DELETE against a name that cannot exist distinguishes the auth wall (401/403)
+        # from "authenticated, target missing" (404) without touching anything real.
+        wall = gw.probe("DELETE", "/data/api/v1/projects/__ign_capability_probe__")
+        out["write_probe_status"] = wall
+        out["writes"] = {401: "require authentication", 403: "forbidden for this credential",
+                         404: "PERMITTED (probe reached the handler)"}.get(wall, "unclear (%s)" % wall)
+        mcp = gw.probe("GET", "/data/api/v1/resources/names/com.inductiveautomation.mcp/server-config")
+        if mcp == 200:
+            names = [i.get("name") if isinstance(i, dict) else i
+                     for i in _items(gw.get("/data/api/v1/resources/names/com.inductiveautomation.mcp/server-config")) or []]
+            out["mcp_servers"] = names
+            out["mcp_endpoints"] = ["POST %s/data/mcp/%s" % (gw.base, n) for n in names]
+    else:
+        out["note"] = ("No resource API on this gateway (pre-8.3). Inspect it through a gateway "
+                       "backup on disk and change it in the Designer. Note that a project authored "
+                       "on 8.3 is not safe to drop onto an 8.1 gateway - the event-script storage "
+                       "format alone differs.")
+    print(_pretty(out))
+
+
+def cmd_config(gw, args):
+    """Show the resolved configuration and where each value came from. Secrets are masked."""
+    print(_config.describe(env=args.env, config_path=args.config,
+                           overrides={"gateway_url": args.url, "api_token": args.token}))
+
+
+def cmd_info(gw, args):
+    print(_pretty(gw.get("/data/api/v1/gateway-info")))
+
+
+def cmd_projects(gw, args):
+    body = gw.get("/data/api/v1/projects/list")
+    items = _items(body) or []
+    if args.json:
+        print(_pretty(items))
+        return
+    rows = []
+    for p in items:
+        cfg = p.get("config", p) if isinstance(p, dict) else {}
+        rows.append((p.get("name", "?"),
+                     cfg.get("parent") or "-",
+                     "inheritable" if cfg.get("inheritable") else "",
+                     "" if cfg.get("enabled", True) else "DISABLED"))
+    w = max([len(r[0]) for r in rows] + [4])
+    p_w = max([len(r[1]) for r in rows] + [6])
+    print("%-*s  %-*s  %s" % (w, "NAME", p_w, "PARENT", "FLAGS"))
+    for name, parent, inh, dis in sorted(rows):
+        print("%-*s  %-*s  %s" % (w, name, p_w, parent, " ".join(x for x in (inh, dis) if x)))
+    print("\n%d projects" % len(rows))
+
+
+def cmd_project(gw, args):
+    print(_pretty(gw.get("/data/api/v1/projects/find/" + urllib.parse.quote(args.name))))
+
+
+def cmd_res(gw, args):
+    mod, _, typ = args.type.partition("/")
+    if not typ:
+        die("expected <module>/<type>, e.g. com.inductiveautomation.historian/historian-provider")
+    verb = {"list": "list", "names": "names", "schema": "type", "singleton": "singleton"}[args.action]
+    path = "/data/api/v1/resources/%s/%s/%s" % (verb, mod, typ)
+    if args.action == "list" and args.name:
+        path = "/data/api/v1/resources/find/%s/%s/%s" % (mod, typ, urllib.parse.quote(args.name))
+    print(_pretty(gw.get(path)))
+
+
+def cmd_logs(gw, args):
+    # Only ever send parameter names the endpoint declares. An unrecognised query param is
+    # treated as an implicit field filter and silently yields matching:0 with HTTP 200
+    # (verified: /logs?limit=1 -> 1 item; /logs?limit=1&zzzBogus=1 -> 0 items, same total).
+    q = {"limit": args.limit}
+    if args.level:
+        q["minLevel"] = args.level.upper()
+    if args.logger:
+        q["logger"] = args.logger
+    if args.search:
+        q["search"] = args.search
+    body = gw.get("/data/api/v1/logs?" + urllib.parse.urlencode(q))
+
+    if isinstance(body, dict):
+        meta = body.get("metadata") or {}
+        if meta.get("matching") == 0 and meta.get("total"):
+            sys.stderr.write("ign: 0 of %s events matched. If you did not filter, check for a "
+                             "misspelled query parameter - the API silently filters on unknown "
+                             "names instead of erroring.\n" % meta["total"])
+    events = _items(body) or []
+    if args.json:
+        print(_pretty(events))
+        return
+    import datetime
+    for e in events if isinstance(events, list) else []:
+        if not isinstance(e, dict):
+            print(e)
+            continue
+        ts = e.get("timestamp")
+        when = ts
+        if isinstance(ts, (int, float)):
+            when = datetime.datetime.fromtimestamp(ts / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+        print("%-19s %-5s %-52s %s" % (when, str(e.get("level", "")).upper(),
+                                       str(e.get("loggerName") or "")[:52],
+                                       str(e.get("message", "")).replace("\n", " ")[:170]))
+        if args.stack and e.get("stack"):
+            for line in e["stack"]:
+                for sub in str(line).replace("\r", "").split("\n")[:14]:
+                    print("      | %s" % sub)
+
+
+def cmd_tags(gw, args):
+    q = {"provider": args.provider, "type": "json", "recursive": "true" if args.recursive else "false"}
+    if args.path:
+        q["path"] = args.path
+    status, body = gw.request("GET", "/data/api/v1/tags/export?" + urllib.parse.urlencode(q), raw=True)
+    if status != 200:
+        die("tag export -> HTTP %s\n%s" % (status, body[:400].decode("utf-8", "replace")), 5)
+    sys.stdout.write(body.decode("utf-8", "replace"))
+
+
+def cmd_export(gw, args):
+    """Fetch a live project as a zip. Anonymous on dev - the zero-auth way to read project state.
+
+    The zip layout is exactly the on-disk tree with project.json at the root.
+    """
+    path = "/data/api/v1/projects/export/" + urllib.parse.quote(args.name)
+    status, body = gw.request("GET", path, raw=True)
+    if status != 200:
+        die("export %s -> HTTP %s\n%s" % (args.name, status,
+                                          body[:300].decode("utf-8", "replace")), 5)
+    out = args.output or ("%s.zip" % args.name)
+    with open(out, "wb") as f:
+        f.write(body)
+    note = ""
+    if args.extract:
+        import zipfile
+        with zipfile.ZipFile(out) as z:
+            z.extractall(args.extract)
+            note = " extracted %d entries to %s" % (len(z.namelist()), args.extract)
+    sys.stderr.write("wrote %s (%d bytes)%s\n" % (out, len(body), note))
+    sys.stderr.write("NOTE: export rewrites every resource.json (signature, actor, key order). "
+                     "Diff payload files only.\n")
+
+
+def cmd_api(gw, args):
+    body = None
+    if args.data:
+        src = sys.stdin.read() if args.data == "-" else args.data
+        try:
+            body = json.loads(src)
+        except ValueError:
+            die("--data is not valid JSON")
+    status, resp = gw.request(args.method, args.path, body=body, allow_write=args.confirm)
+    sys.stderr.write("HTTP %s\n" % status)
+    print(_pretty(resp))
+    sys.exit(0 if 200 <= status < 300 else 5)
+
+
+def cmd_scan(gw, args):
+    status, resp = gw.request("POST", "/data/api/v1/scan/projects", allow_write=args.confirm)
+    sys.stderr.write("HTTP %s\n" % status)
+    print(_pretty(resp))
+
+
+def main():
+    # The global options live on a parent parser so they parse either before OR after the
+    # subcommand. argparse only accepts them before it otherwise, which is the opposite of how
+    # anyone types `ign api POST /path --confirm`.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--url", help="gateway base URL (overrides $IGN_URL and the config file)", default=argparse.SUPPRESS)
+    common.add_argument("--token", help="API token (overrides $IGN_API_TOKEN and the config file)", default=argparse.SUPPRESS)
+    common.add_argument("--confirm", action="store_true", help="permit non-GET requests", default=argparse.SUPPRESS)
+    common.add_argument("--env", help="config-file section to use: dev or prod "
+                                     "(default $AUTOMATION_ENV, else dev)",
+                       default=argparse.SUPPRESS)
+    common.add_argument("--config", help="path to a config file, overriding the search order", default=argparse.SUPPRESS)
+
+    ap = argparse.ArgumentParser(prog="ign", description=__doc__, parents=[common],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def add(name, **kw):
+        return sub.add_parser(name, parents=[common], **kw)
+
+    add("capabilities", help="which tier is this gateway, and what can I do here?")
+    add("config", help="show resolved settings and where each came from (secrets masked)")
+    add("info", help="gateway name, version, edition, timezone")
+
+    p = add("projects", help="list projects with their parent and flags")
+    p.add_argument("--json", action="store_true")
+
+    p = add("project", help="one project's detail")
+    p.add_argument("name")
+
+    p = add("res", help="read gateway config resources")
+    p.add_argument("action", choices=["list", "names", "schema", "singleton"],
+                   help="schema = the JSON schema for the type, which is what you want before authoring one")
+    p.add_argument("type", help="<module>/<type>, e.g. com.cirruslink.mqtt.engine.gateway/server")
+    p.add_argument("name", nargs="?", help="with 'list', read this single resource")
+
+    p = add("logs", help="recent gateway log events")
+    p.add_argument("--logger", help="filter by logger name")
+    p.add_argument("--level", help="minimum level: TRACE DEBUG INFO WARN ERROR")
+    p.add_argument("--search", help="whitespace-separated search terms")
+    p.add_argument("--stack", action="store_true", help="print stack traces")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--json", action="store_true")
+
+    p = add("tags", help="export tags as JSON")
+    p.add_argument("--provider", default="default")
+    p.add_argument("--path")
+    p.add_argument("--recursive", action="store_true", default=True)
+
+    add("scan", help="request a project scan so hand edits on disk are picked up")
+
+    p = add("export", help="download a project as a zip (anonymous on dev)")
+    p.add_argument("name")
+    p.add_argument("-o", "--output", help="output zip path (default <name>.zip)")
+    p.add_argument("--extract", metavar="DIR", help="also extract into DIR")
+
+    p = add("api", help="raw request escape hatch")
+    p.add_argument("method")
+    p.add_argument("path")
+    p.add_argument("--data", help="JSON body, or - for stdin")
+
+    args = ap.parse_args()
+    # Shared options use SUPPRESS so a subparser cannot clobber them; fill the gaps.
+    for _k, _d in (("url", None), ("token", None), ("confirm", False), ("env", None), ("config", None)):
+        if not hasattr(args, _k):
+            setattr(args, _k, _d)
+    gw = Gateway(url=args.url, token=args.token, env=args.env, config_path=args.config)
+    {"capabilities": cmd_capabilities, "config": cmd_config, "info": cmd_info, "projects": cmd_projects,
+     "project": cmd_project, "res": cmd_res, "logs": cmd_logs, "tags": cmd_tags,
+     "scan": cmd_scan, "export": cmd_export, "api": cmd_api}[args.cmd](gw, args)
+
+
+if __name__ == "__main__":
+    main()

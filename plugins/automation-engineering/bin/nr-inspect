@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""nr-inspect - read an Opto 22 groov RIO / Node-RED device backup without opening Node-RED.
+
+Node-RED on these devices (port 1880) is not reachable from most hosts in this estate, and a device
+backup zip is a whole-device archive rather than just flows. This reads either straight from the zip,
+from an extracted directory, or from a bare flows.json.
+
+    nr-inspect summary  <zip|dir|flows.json>
+    nr-inspect topics   <zip|dir|flows.json>     # the MQTT contract with Ignition
+    nr-inspect lint     <zip|dir|flows.json>     # defects seen in this estate
+    nr-inspect devices  <zip|dir|flows.json>     # serial / modbus / groov I/O wiring
+
+The `topics` view is the important one: those topic strings ARE the interface between the edge device
+and Ignition, so they are what you diff when a tag stops updating after a flow change.
+
+Zero dependencies (stdlib only).
+"""
+
+import argparse
+import collections
+import io
+import json
+import os
+import re
+import sys
+import zipfile
+
+MQTT_OUT, MQTT_IN, BROKER = "mqtt out", "mqtt in", "mqtt-broker"
+# Topics are built by string concatenation in function nodes; an undefined value concatenates
+# silently and creates a bogus root. Prod carries 17+ such orphan tag trees.
+UNDEF_RE = re.compile(r"msg\.topic\s*=\s*[^;\n]*\b(undefined|null)\b|"
+                      r"msg\.topic\s*=\s*[^;\n]*\+\s*(?:msg|flow|global)\.[A-Za-z_$][\w$]*")
+SECRET_RE = re.compile(r"""(?ix)\b(api[_-]?key|apikey|token|password|passwd|secret|bearer)\b\s*
+                           [:=]\s*['"][A-Za-z0-9_\-./+]{12,}['"]""")
+
+
+def die(msg, code=1):
+    sys.stderr.write("nr-inspect: %s\n" % msg)
+    sys.exit(code)
+
+
+def load_flows(path):
+    """Return (flows_list, source_label, extra_files_present)."""
+    if os.path.isdir(path):
+        for cand in (os.path.join(path, "node-red", "flows.json"),
+                     os.path.join(path, "flows.json")):
+            if os.path.isfile(cand):
+                with open(cand, encoding="utf-8", errors="replace") as f:
+                    return json.load(f), cand, sorted(os.listdir(path))
+        die("no flows.json under %s" % path)
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            hits = [n for n in names if n.endswith("node-red/flows.json") or n == "flows.json"]
+            if not hits:
+                die("no node-red/flows.json inside %s" % path)
+            with z.open(sorted(hits, key=len)[0]) as f:
+                data = json.load(io.TextIOWrapper(f, encoding="utf-8", errors="replace"))
+            return data, "%s!%s" % (path, sorted(hits, key=len)[0]), names
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return json.load(f), path, []
+    die("%s does not exist" % path)
+
+
+def index(flows):
+    return {n["id"]: n for n in flows if isinstance(n, dict) and "id" in n}
+
+
+def tab_name(nodes, node):
+    t = nodes.get(node.get("z") or "")
+    return (t or {}).get("label") or (t or {}).get("name") or node.get("z") or "-"
+
+
+def broker_of(nodes, node):
+    b = nodes.get(node.get("broker") or "")
+    if not b:
+        return "-"
+    return "%s (%s:%s)" % (b.get("name") or "unnamed", b.get("broker"), b.get("port"))
+
+
+def cmd_summary(flows, src, extra, args):
+    nodes = index(flows)
+    types = collections.Counter(n.get("type") for n in flows if isinstance(n, dict))
+    tabs = [n for n in flows if isinstance(n, dict) and n.get("type") == "tab"]
+    print("source : %s" % src)
+    print("nodes  : %d across %d tab(s)" % (len(flows), len(tabs)))
+    if extra:
+        device = [d for d in ("io", "mmpSettings", "network", "firewall", "snmp", "accounts",
+                              "time", "usb", "bluetooth", "staticroutes", "data-service")
+                  if any(e.startswith(d + "/") or e == d for e in extra)]
+        if device:
+            print("device : whole-device backup, also contains %s" % ", ".join(device))
+    print("\nnode types:")
+    for t, n in types.most_common():
+        print("  %4d  %s" % (n, t))
+    print("\ntabs:")
+    for t in tabs:
+        cnt = sum(1 for n in flows if isinstance(n, dict) and n.get("z") == t["id"])
+        print("  %-44s %3d nodes%s" % (t.get("label") or t.get("name") or t["id"], cnt,
+                                       "  [DISABLED]" if t.get("disabled") else ""))
+    brokers = [n for n in flows if isinstance(n, dict) and n.get("type") == BROKER]
+    print("\nbrokers:")
+    for b in brokers:
+        print("  %-26s %s:%s  mqtt%s  clientid=%r  cleansession=%s keepalive=%s tls=%s"
+              % (b.get("name") or "unnamed", b.get("broker"), b.get("port"),
+                 {"4": "3.1.1", "3": "3.1", "5": "5"}.get(str(b.get("protocolVersion")), "?"),
+                 b.get("clientid") or "", b.get("cleansession"), b.get("keepalive"),
+                 b.get("usetls")))
+    if not brokers:
+        print("  (none)")
+
+
+def collect_topics(flows):
+    nodes = index(flows)
+    pub, sub = [], []
+    for n in flows:
+        if not isinstance(n, dict):
+            continue
+        if n.get("type") == MQTT_OUT:
+            pub.append(n)
+        elif n.get("type") == MQTT_IN:
+            sub.append(n)
+    return nodes, pub, sub
+
+
+def cmd_topics(flows, src, extra, args):
+    nodes, pub, sub = collect_topics(flows)
+    # 107 of 304 mqtt in nodes across this estate subscribe DYNAMICALLY: inputs == 1 and the topic
+    # arrives as msg.topic from a JSONata expression over a global. Their subscription cannot be
+    # read statically, so say so rather than letting the reader think this list is complete.
+    dynamic = [n for n in sub if n.get("inputs") == 1 or not n.get("topic")]
+    dynamic_out = [n for n in pub if not n.get("topic")]
+    print("=== PUBLISHES (device -> Ignition), %d mqtt out node(s) ===" % len(pub))
+    for n in sorted(pub, key=lambda x: str(x.get("topic") or "")):
+        t = n.get("topic")
+        label = repr(t) if t else "<from msg.topic — set upstream>"
+        print("  %-58s qos=%-4s retain=%-5s  [%s]"
+              % (label, n.get("qos") if n.get("qos") not in (None, "") else "0(unset)",
+                 n.get("retain"), tab_name(nodes, n)))
+    print("\n=== SUBSCRIBES (Ignition -> device), %d mqtt in node(s) ===" % len(sub))
+    seen = collections.Counter(str(n.get("topic") or "") for n in sub)
+    for t, c in sorted(seen.items()):
+        print("  %-58s x%-2d [%s]" % (repr(t) if t else "<empty>", c,
+                                      ", ".join(sorted({tab_name(nodes, n) for n in sub
+                                                        if str(n.get("topic") or "") == t}))))
+    roots = collections.Counter()
+    for n in pub + sub:
+        t = str(n.get("topic") or "")
+        if t:
+            roots["/".join(t.split("/")[:4])] += 1
+    if roots:
+        print("\n=== equipment prefixes referenced ===")
+        for r, c in roots.most_common():
+            print("  %4d  %s" % (c, r))
+        if len(roots) > 1:
+            print("\n  More than one equipment prefix appears. On a single-equipment device that "
+                  "usually means the flow was cloned from another bench and not fully rewritten.")
+
+    if dynamic or dynamic_out:
+        print("\n=== INCOMPLETE: %d subscription(s) and %d publish(es) are DYNAMIC ==="
+              % (len(dynamic), len(dynamic_out)))
+        print("  Their topic is not in the node - it arrives as msg.topic, normally built from a\n"
+              "  Node-RED global holding the site prefix. This estate uses four names for that\n"
+              "  global (GlobalPath, MQTTPath, MQTTPrefix, GlobalPath2), seeded by a one-shot inject.\n"
+              "  Grep the function nodes for global.get / $globalContext to resolve them, and treat\n"
+              "  the lists above as a lower bound.")
+
+
+def cmd_devices(flows, src, extra, args):
+    nodes = index(flows)
+    ser = [n for n in flows if isinstance(n, dict) and n.get("type") == "serial-port"]
+    print("=== serial ports (%d) ===" % len(ser))
+    for s in ser:
+        print("  %-20s %s baud %s%s%s  newline=%r addchar=%r timeout=%s"
+              % (s.get("serialport"), s.get("serialbaud"), s.get("databits"),
+                 str(s.get("parity") or "?")[0].upper(), s.get("stopbits"),
+                 s.get("newline"), s.get("addchar"), s.get("responsetimeout")))
+    for kind, label in (("modbus-client", "modbus clients"),
+                        ("groov-io-device", "groov I/O devices")):
+        got = [n for n in flows if isinstance(n, dict) and n.get("type") == kind]
+        print("\n=== %s (%d) ===" % (label, len(got)))
+        for g in got:
+            keep = {k: v for k, v in g.items()
+                    if k in ("name", "host", "port", "unit_id", "device", "address", "protocol")}
+            print("  %s" % (keep or {k: v for k, v in g.items() if k not in ("id", "type", "z")}))
+    io_nodes = collections.Counter(n.get("type") for n in flows
+                                  if isinstance(n, dict) and str(n.get("type", "")).startswith("groov-io"))
+    if io_nodes:
+        print("\n=== groov I/O node usage ===")
+        for t, c in io_nodes.most_common():
+            print("  %4d  %s" % (c, t))
+
+
+def cmd_lint(flows, src, extra, args):
+    nodes, pub, sub = collect_topics(flows)
+    issues = []
+
+    for n in pub:
+        if not n.get("topic"):
+            issues.append(("WARN", "mqtt out %r on tab %r has an EMPTY topic, so it publishes to "
+                                   "whatever msg.topic the upstream node set. This is how the "
+                                   "'undefined...' orphan tag roots in production were created - "
+                                   "validate the topic before publishing."
+                           % (n.get("name") or n["id"], tab_name(nodes, n))))
+        if n.get("qos") in (None, ""):
+            issues.append(("NOTE", "mqtt out %r has qos unset (Node-RED treats it as 0)."
+                           % (n.get("name") or n.get("topic") or n["id"])))
+        if n.get("topic") and str(n.get("retain")).lower() not in ("true", "1"):
+            issues.append(("NOTE", "mqtt out %r is not retained. Telemetry here is retained so the "
+                                   "Ignition tag survives a gateway restart." % n.get("topic")))
+
+    for n in flows:
+        if not isinstance(n, dict):
+            continue
+        code = n.get("func") or ""
+        if n.get("type") == "function" and code:
+            # A long opaque literal assigned straight to msg.payload and published is how the
+            # estate leaked an API key onto the broker, retained and in cleartext. Report the
+            # location and the length only - never the value.
+            for m in re.finditer(r"""msg\.payload\s*=\s*['"]([A-Za-z0-9_\-]{16,})['"]""", code):
+                dests = [nodes.get(w) for grp in (n.get("wires") or []) for w in grp]
+                topics = [d.get("topic") for d in dests if d and d.get("type") == MQTT_OUT]
+                issues.append(("ERROR",
+                               "function %r assigns a %d-character opaque literal to msg.payload and "
+                               "publishes it to %s. If that is a credential it is now retained on the "
+                               "broker in cleartext and sitting in this backup. Move it to a secret "
+                               "store and rotate it."
+                               % (n.get("name") or n["id"], len(m.group(1)),
+                                  topics or "<a topic set upstream>")))
+            if UNDEF_RE.search(code):
+                issues.append(("WARN", "function %r builds msg.topic by concatenation. If any part "
+                                       "is undefined the topic silently becomes 'undefined...' and "
+                                       "MQTT Engine creates an orphan tag tree."
+                               % (n.get("name") or n["id"])))
+            if SECRET_RE.search(code):
+                issues.append(("ERROR", "function %r appears to contain a hardcoded credential. "
+                                        "Do not publish secrets to the broker - broker payloads are "
+                                        "retained and readable by anyone on the network."
+                               % (n.get("name") or n["id"])))
+        if n.get("type") == "debug" and n.get("active", True):
+            issues.append(("NOTE", "debug node %r is enabled." % (n.get("name") or n["id"])))
+
+    roots = {"/".join(str(n.get("topic") or "").split("/")[:4])
+             for n in pub + sub if n.get("topic")}
+    roots.discard("")
+    if len(roots) > 1:
+        issues.append(("WARN", "this device references %d equipment prefixes: %s. A cloned flow that "
+                               "keeps another bench's topics makes two benches command each other."
+                       % (len(roots), ", ".join(sorted(roots)))))
+
+    pub_t = {str(n.get("topic")) for n in pub if n.get("topic")}
+    for n in sub:
+        t = str(n.get("topic") or "")
+        if t and t in pub_t and "/HMI_COM/" in t:
+            issues.append(("NOTE", "%s is both subscribed and published retained on this device. "
+                                   "That is the normal HMI_COM command+state pattern, but confirm it "
+                                   "cannot feed back on itself." % t))
+
+    order = {"ERROR": 0, "WARN": 1, "NOTE": 2}
+    for lvl, msg in sorted(issues, key=lambda x: order[x[0]]):
+        print("%-5s %s" % (lvl, msg))
+    n_err = sum(1 for l, _ in issues if l == "ERROR")
+    print("\n%d issue(s), %d error(s)" % (len(issues), n_err))
+    return 1 if n_err else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="nr-inspect", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", choices=["summary", "topics", "lint", "devices"])
+    ap.add_argument("path", help="device backup zip, extracted directory, or flows.json")
+    args = ap.parse_args()
+    flows, src, extra = load_flows(args.path)
+    if not isinstance(flows, list):
+        die("flows.json did not contain a JSON array")
+    fn = {"summary": cmd_summary, "topics": cmd_topics, "lint": cmd_lint, "devices": cmd_devices}
+    sys.exit(fn[args.command](flows, src, extra, args) or 0)
+
+
+if __name__ == "__main__":
+    main()

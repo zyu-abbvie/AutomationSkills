@@ -1,0 +1,83 @@
+# automation-engineering - local configuration
+#
+# TEMPLATE - committed. Copy it, or generate a pre-filled one:
+#
+#     plugins/automation-engineering/bin/init-config
+#
+# The generator seeds every field it can find from doc/credential.yaml and your environment,
+# writes automation.local.yaml with mode 600, and never prints a secret to the terminal.
+# automation.local.yaml is gitignored; THIS file must stay free of real credentials.
+#
+# Precedence, highest first:  command-line flag > environment variable > this file > built-in default
+# Check what actually resolved, with secrets masked:
+#
+#     plugins/automation-engineering/bin/ign config
+#     plugins/automation-engineering/bin/ign config --env prod
+#
+# Select an environment per command with --env dev / --env prod, or export AUTOMATION_ENV.
+# Any value may indirect through the environment: api_token: ${IGNITION_TOKEN}
+
+# --------------------------------------------------------------------------------------------
+# Global
+# --------------------------------------------------------------------------------------------
+
+# Hosts treated as production. The bundled tools refuse to send writes to these, and the
+# PreToolUse hook asks before any command that names one.
+prod_hosts: wz02163d
+
+# Where the on-disk reference material lives. Leave empty if doc/ sits beside this file.
+# Teammates who clone without doc/ can point these at a share instead of symlinking.
+backups_dir: ""
+nodered_backups_dir: ""
+
+# --------------------------------------------------------------------------------------------
+# dev - Ignition 8.3.7 on wa03593d
+#   Has the HTTP API and the MCP server. API reads are anonymous; writes need api_token.
+#   Broker carries bench and training traffic only - no field device publishes here, so do not
+#   use it to decide whether equipment is alive.
+# --------------------------------------------------------------------------------------------
+dev:
+  gateway_url: "http://wa03593d:8088"
+
+  # Needed for API WRITES and for every MCP tool (searchPitfalls, addPitfall, readTags, ...).
+  # Create one in the Gateway: Config > Security > API Tokens.
+  api_token: ""
+  mcp_server: MCP_Tools
+
+  mqtt_host: 10.72.167.253
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_keepalive: 60
+  mqtt_tls: false
+
+  # Informational: there is no SQL Server driver on most hosts here, so the tools route SQL
+  # through Ignition (a named query, or the MCP evalScript / queryTagHistory tools).
+  sql_server: WQ01982D
+  sql_database: Ignition
+  sql_uid: ""
+  sql_password: ""
+
+# --------------------------------------------------------------------------------------------
+# prod - Ignition 8.1.28 on wz02163d
+#   NO HTTP API at all: every /data/api/v1 route returns 404, and there is no MCP server.
+#   Inspect it through a gateway backup on disk; change it in the Designer.
+#   The broker here is where every groov RIO field device actually publishes.
+# --------------------------------------------------------------------------------------------
+prod:
+  gateway_url: "http://wz02163d:8088"
+
+  # Nothing to authenticate to - leave empty.
+  api_token: ""
+
+  mqtt_host: 10.94.132.35
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_keepalive: 60
+  mqtt_tls: false
+
+  sql_server: WA06015P
+  sql_database: Ignition
+  sql_uid: ""
+  sql_password: ""

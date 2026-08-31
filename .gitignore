@@ -1,0 +1,15 @@
+# Local configuration and credentials - never commit these.
+automation.local.yaml
+automation.local.yml
+doc/credential.yaml
+*.token
+.env
+
+# doc/ is source material, not deliverable: 3.6 GB of gateway backups, groov RIO device
+# backups and vendor manuals, plus credential.yaml. It also contains a superseded
+# ignition-tooling plugin with its own .claude-plugin/marketplace.json, which would confuse
+# plugin discovery if it were committed alongside the real one. Keep all of it local.
+doc/
+
+__pycache__/
+*.pyc

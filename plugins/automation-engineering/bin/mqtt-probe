@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""mqtt-probe - connect to an MQTT 3.1.1 broker, watch topics, publish a test message.
+
+Zero dependencies: speaks MQTT on a raw socket, because paho-mqtt is not installed on the
+hosts this plugin runs on and a broker check should never be blocked on a pip install.
+
+Answers the three questions you actually have when an integration looks dead:
+  1. Can I even reach and authenticate to the broker?      mqtt-probe check
+  2. What is being published, and on which topics?         mqtt-probe watch '#' --seconds 15
+  3. Does a command I publish get through?                 mqtt-probe pub <topic> <payload>
+
+Sparkplug B payloads are protobuf, not JSON. `watch` decodes metric names and scalar values
+on a best-effort basis so you can see whether a device is alive without a protobuf library.
+
+Configuration comes from, highest precedence first: a flag, an environment variable
+(MQTT_HOST / MQTT_PORT / MQTT_USERNAME / MQTT_PASSWORD), then the local config file
+(automation.local.yaml, or the estate's existing doc/credential.yaml). `--env prod` selects the
+production broker section. Run `ign config --env prod` to see what will be used.
+
+Never hardcode credentials into a repo. The config file is gitignored for that reason.
+"""
+
+import argparse
+import json
+import os
+import socket
+import struct
+import sys
+import time
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+import _config  # noqa: E402  (sibling module, resolved relative to this script)
+
+CONNECT, CONNACK, PUBLISH, SUBSCRIBE, SUBACK, PINGREQ, PINGRESP, DISCONNECT = (
+    0x10, 0x20, 0x30, 0x82, 0x90, 0xC0, 0xD0, 0xE0)
+
+CONNACK_MEANING = {
+    0: "accepted",
+    1: "refused: unacceptable protocol version",
+    2: "refused: client id rejected",
+    3: "refused: server unavailable",
+    4: "refused: bad username or password",
+    5: "refused: not authorised",
+}
+
+
+def die(msg, code=1):
+    sys.stderr.write("mqtt-probe: %s\n" % msg)
+    sys.exit(code)
+
+
+def _rlen_encode(n):
+    out = bytearray()
+    while True:
+        b = n % 128
+        n //= 128
+        if n:
+            b |= 0x80
+        out.append(b)
+        if not n:
+            return bytes(out)
+
+
+def _str(s):
+    b = s.encode("utf-8")
+    return struct.pack("!H", len(b)) + b
+
+
+class Client(object):
+    def __init__(self, host, port, username=None, password=None, client_id=None, keepalive=30):
+        self.host, self.port = host, int(port)
+        self.username, self.password = username, password
+        # A duplicate client id makes the broker kick the older session off, which looks like a
+        # flapping device. Always make ours unique.
+        self.client_id = client_id or ("mqtt-probe-%d" % (os.getpid() ^ int(time.time()) & 0xFFFF))
+        self.keepalive = keepalive
+        self.sock = None
+        self.buf = b""
+        self.pid = 0
+
+    # ---------------------------------------------------------------- transport
+    def connect(self, timeout=8):
+        try:
+            self.sock = socket.create_connection((self.host, self.port), timeout=timeout)
+        except OSError as e:
+            die("cannot reach %s:%s (%s)" % (self.host, self.port, e), 4)
+        self.sock.settimeout(timeout)
+
+        flags = 0x02  # clean session
+        payload = _str(self.client_id)
+        if self.username:
+            flags |= 0x80
+            payload += _str(self.username)
+            if self.password is not None:
+                flags |= 0x40
+                payload += _str(self.password)
+        var = _str("MQTT") + bytes([0x04, flags]) + struct.pack("!H", self.keepalive)
+        body = var + payload
+        self.sock.sendall(bytes([CONNECT]) + _rlen_encode(len(body)) + body)
+
+        kind, data = self.read_packet()
+        if kind is None or (kind & 0xF0) != CONNACK:
+            die("no CONNACK from %s:%s (got %r)" % (self.host, self.port, kind), 5)
+        rc = data[1] if len(data) > 1 else 255
+        if rc != 0:
+            die("broker %s" % CONNACK_MEANING.get(rc, "refused with code %d" % rc), 6)
+        return self
+
+    def read_packet(self, timeout=None):
+        """Return (first_byte, remaining_bytes) or (None, None) on timeout/close."""
+        if timeout is not None:
+            self.sock.settimeout(timeout)
+        try:
+            hdr = self._recv_exact(1)
+            if not hdr:
+                return None, None
+            first = hdr[0]
+            mult, length = 1, 0
+            while True:
+                b = self._recv_exact(1)
+                if not b:
+                    return None, None
+                length += (b[0] & 0x7F) * mult
+                if not (b[0] & 0x80):
+                    break
+                mult *= 128
+                if mult > 128 ** 4:
+                    die("malformed remaining-length from broker", 5)
+            return first, self._recv_exact(length) if length else b""
+        except socket.timeout:
+            return None, None
+
+    def _recv_exact(self, n):
+        while len(self.buf) < n:
+            try:
+                chunk = self.sock.recv(max(4096, n - len(self.buf)))
+            except socket.timeout:
+                raise
+            if not chunk:
+                return None
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    # ---------------------------------------------------------------- operations
+    def subscribe(self, topics, qos=0):
+        self.pid += 1
+        body = struct.pack("!H", self.pid)
+        for t in topics:
+            body += _str(t) + bytes([qos])
+        self.sock.sendall(bytes([SUBSCRIBE]) + _rlen_encode(len(body)) + body)
+        kind, data = self.read_packet(timeout=8)
+        if kind is None or (kind & 0xF0) != SUBACK:
+            die("no SUBACK for %s" % (topics,), 5)
+        # 0x80 in the return-code payload means the broker refused that subscription (ACL).
+        for i, rc in enumerate(data[2:]):
+            if rc == 0x80:
+                die("broker refused subscription to %r (not authorised)" % topics[i], 6)
+        return self
+
+    def publish(self, topic, payload, qos=0, retain=False):
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        first = PUBLISH | (qos << 1) | (1 if retain else 0)
+        body = _str(topic)
+        if qos:
+            self.pid += 1
+            body += struct.pack("!H", self.pid)
+        body += payload
+        self.sock.sendall(bytes([first]) + _rlen_encode(len(body)) + body)
+        if qos == 1:
+            kind, _ = self.read_packet(timeout=8)
+            if kind is None or (kind & 0xF0) != 0x40:
+                die("no PUBACK - broker did not acknowledge the QoS 1 publish", 5)
+        return self
+
+    def ping(self):
+        self.sock.sendall(bytes([PINGREQ, 0]))
+
+    def close(self):
+        try:
+            self.sock.sendall(bytes([DISCONNECT, 0]))
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def parse_publish(first, data):
+    tlen = struct.unpack("!H", data[:2])[0]
+    topic = data[2:2 + tlen].decode("utf-8", "replace")
+    rest = data[2 + tlen:]
+    qos = (first & 0x06) >> 1
+    if qos:
+        rest = rest[2:]
+    return topic, rest, qos, bool(first & 0x01)
+
+
+# ------------------------------------------------------------- payload rendering
+
+def _pb_varint(b, i):
+    shift = result = 0
+    while i < len(b):
+        x = b[i]
+        i += 1
+        result |= (x & 0x7F) << shift
+        if not (x & 0x80):
+            return result, i
+        shift += 7
+        if shift > 63:
+            break
+    return None, i
+
+
+def sparkplug_summary(raw, limit=12):
+    """Best-effort walk of Sparkplug B protobuf: pull metric names and scalar values.
+
+    Sparkplug's Payload has field 2 = repeated Metric; a Metric has field 1 = name (string),
+    and value fields 10-13 for int/long/float/double, 12/13 overlapping with bool/string in
+    practice. We do not have the schema, so we report names and any adjacent scalar we can
+    read, and say so rather than pretending this is a real decode.
+    """
+    names, i = [], 0
+    while i < len(raw) and len(names) < limit:
+        key, i = _pb_varint(raw, i)
+        if key is None:
+            break
+        field, wire = key >> 3, key & 0x07
+        if wire == 2:
+            ln, i = _pb_varint(raw, i)
+            if ln is None or i + ln > len(raw):
+                break
+            chunk = raw[i:i + ln]
+            i += ln
+            if field == 2:  # a Metric submessage
+                sub = chunk
+                j = 0
+                nm = None
+                while j < len(sub):
+                    k2, j = _pb_varint(sub, j)
+                    if k2 is None:
+                        break
+                    f2, w2 = k2 >> 3, k2 & 0x07
+                    if w2 == 2:
+                        l2, j = _pb_varint(sub, j)
+                        if l2 is None or j + l2 > len(sub):
+                            break
+                        v = sub[j:j + l2]
+                        j += l2
+                        if f2 == 1:
+                            try:
+                                nm = v.decode("utf-8")
+                            except UnicodeDecodeError:
+                                nm = repr(v[:24])
+                    elif w2 == 0:
+                        _, j = _pb_varint(sub, j)
+                    elif w2 == 5:
+                        j += 4
+                    elif w2 == 1:
+                        j += 8
+                    else:
+                        break
+                if nm:
+                    names.append(nm)
+        elif wire == 0:
+            _, i = _pb_varint(raw, i)
+        elif wire == 5:
+            i += 4
+        elif wire == 1:
+            i += 8
+        else:
+            break
+    return names
+
+
+def render(raw, maxlen=280, decode_sparkplug=True):
+    if not raw:
+        return "<empty>"
+    try:
+        text = raw.decode("utf-8")
+        try:
+            return "json " + json.dumps(json.loads(text), separators=(",", ":"))[:maxlen]
+        except ValueError:
+            if text.isprintable() or "\n" in text:
+                return "text " + text.replace("\n", " ")[:maxlen]
+    except UnicodeDecodeError:
+        pass
+    if decode_sparkplug:
+        names = sparkplug_summary(raw)
+        if names:
+            return "sparkplug-pb %d bytes, metrics: %s" % (len(raw), ", ".join(names[:12]))
+    return "binary %d bytes %s" % (len(raw), raw[:24].hex())
+
+
+# ------------------------------------------------------------------------ commands
+
+def cmd_check(c, args):
+    t0 = time.time()
+    c.connect()
+    ms = int((time.time() - t0) * 1000)
+    out = {"broker": "%s:%s" % (c.host, c.port), "connack": "accepted",
+           "client_id": c.client_id, "auth": "username" if c.username else "anonymous",
+           "connect_ms": ms}
+    # Subscribing to $SYS is how you tell a Mosquitto-family broker from Chariot/HiveMQ.
+    try:
+        c.subscribe(["$SYS/broker/version"], qos=0)
+        out["sys_topic"] = "subscribe accepted"
+        kind, data = c.read_packet(timeout=3)
+        if kind is not None and (kind & 0xF0) == PUBLISH:
+            topic, payload, _, _ = parse_publish(kind, data)
+            out["broker_version"] = payload.decode("utf-8", "replace")[:80]
+    except SystemExit:
+        out["sys_topic"] = "refused (normal on non-Mosquitto brokers)"
+    print(json.dumps(out, indent=2))
+    c.close()
+
+
+def cmd_watch(c, args):
+    c.connect().subscribe(args.topic, qos=args.qos)
+    sys.stderr.write("watching %s on %s:%s for %ds (ctrl-c to stop)\n"
+                     % (", ".join(args.topic), c.host, c.port, args.seconds))
+    deadline = time.time() + args.seconds
+    seen, count, last_ping = {}, 0, time.time()
+    while time.time() < deadline:
+        if time.time() - last_ping > c.keepalive / 2:
+            c.ping()
+            last_ping = time.time()
+        kind, data = c.read_packet(timeout=1.0)
+        if kind is None:
+            continue
+        if (kind & 0xF0) != PUBLISH:
+            continue
+        topic, payload, qos, retain = parse_publish(kind, data)
+        count += 1
+        seen[topic] = seen.get(topic, 0) + 1
+        if not args.summary:
+            print("%s  %-58s %s%s" % (time.strftime("%H:%M:%S"), topic[:58],
+                                      "[retain] " if retain else "",
+                                      render(payload, args.maxlen)))
+    c.close()
+    sys.stderr.write("\n%d messages on %d distinct topics\n" % (count, len(seen)))
+    if args.summary or args.topics:
+        for t, n in sorted(seen.items(), key=lambda kv: -kv[1]):
+            print("%6d  %s" % (n, t))
+    if not count:
+        sys.stderr.write("No traffic. Either nothing is publishing to %s, or the broker ACL "
+                         "silently allows the subscribe but delivers nothing.\n" % args.topic)
+
+
+def cmd_pub(c, args):
+    c.connect().publish(args.topic, args.payload, qos=args.qos, retain=args.retain)
+    print(json.dumps({"published": args.topic, "bytes": len(args.payload),
+                      "qos": args.qos, "retain": args.retain,
+                      "acknowledged": args.qos == 1}, indent=2))
+    c.close()
+
+
+def main():
+    # Global options live on a parent parser so they work either before OR after the subcommand.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--host", default=argparse.SUPPRESS)
+    common.add_argument("--port", type=int, default=argparse.SUPPRESS)
+    common.add_argument("--username", default=argparse.SUPPRESS)
+    common.add_argument("--password", default=argparse.SUPPRESS)
+    common.add_argument("--client-id", default=argparse.SUPPRESS)
+    common.add_argument("--env", help="config-file section: dev or prod "
+                                      "(default $AUTOMATION_ENV, else dev)",
+                       default=argparse.SUPPRESS)
+    common.add_argument("--config", help="path to a config file, overriding the search order", default=argparse.SUPPRESS)
+
+    ap = argparse.ArgumentParser(prog="mqtt-probe", description=__doc__, parents=[common],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def add(name, **kw):
+        return sub.add_parser(name, parents=[common], **kw)
+
+    add("check", help="connect, authenticate, report broker identity")
+
+    p = add("watch", help="subscribe and print live messages")
+    p.add_argument("topic", nargs="*", default=["#"])
+    p.add_argument("--seconds", type=int, default=15)
+    p.add_argument("--qos", type=int, default=0, choices=[0, 1])
+    p.add_argument("--maxlen", type=int, default=280)
+    p.add_argument("--summary", action="store_true", help="only the topic/count table")
+    p.add_argument("--topics", action="store_true", help="also print the topic/count table")
+
+    p = add("pub", help="publish one message")
+    p.add_argument("topic")
+    p.add_argument("payload")
+    p.add_argument("--qos", type=int, default=1, choices=[0, 1])
+    p.add_argument("--retain", action="store_true")
+
+    args = ap.parse_args()
+    # Shared options use SUPPRESS so a subparser cannot clobber them; fill the gaps.
+    for _k, _d in (("host", None), ("port", None), ("username", None), ("password", None), ("client_id", None), ("env", None), ("config", None)):
+        if not hasattr(args, _k):
+            setattr(args, _k, _d)
+    if args.cmd == "watch" and not args.topic:
+        args.topic = ["#"]
+
+    cfg, _why, _path = _config.load(
+        env=args.env, config_path=args.config,
+        overrides={"mqtt_host": args.host, "mqtt_port": args.port,
+                   "mqtt_username": args.username, "mqtt_password": args.password})
+
+    # This client speaks plaintext MQTT only. If the config asks for TLS, refuse rather than
+    # quietly connecting in the clear - a silent downgrade is worse than a failure.
+    if _config.truthy(cfg.get("mqtt_tls")):
+        die("configuration requests TLS (mqtt_tls), which this tool does not implement. It would "
+            "otherwise connect in plaintext. Use a TLS-capable client, or set mqtt_tls: false if "
+            "the broker really is plaintext (both brokers in this estate are).", 2)
+
+    try:
+        keepalive = int(cfg.get("mqtt_keepalive") or 60)
+    except ValueError:
+        keepalive = 60
+
+    c = Client(cfg["mqtt_host"], cfg["mqtt_port"] or 1883,
+               cfg["mqtt_username"] or None, cfg["mqtt_password"] or None, args.client_id,
+               keepalive=keepalive)
+    {"check": cmd_check, "watch": cmd_watch, "pub": cmd_pub}[args.cmd](c, args)
+
+
+if __name__ == "__main__":
+    main()

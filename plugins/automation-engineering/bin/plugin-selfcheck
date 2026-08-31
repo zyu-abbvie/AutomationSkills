@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""plugin-selfcheck - validate this plugin before publishing it to the team.
+
+Checks the manifests parse and resolve, every SKILL.md has usable frontmatter, every referenced
+reference file and bin tool actually exists, every bundled script compiles and is executable, and
+crucially that no credential from doc/credential.yaml has leaked into a committed file.
+
+The secret scan reads candidate values out of the credential file at runtime rather than embedding
+them, so this script never itself contains a secret.
+
+    plugin-selfcheck [--plugin <dir>] [--credentials <path>]
+
+Exit status: 0 clean, 1 problems found.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+
+FRONTMATTER = re.compile(r"^---\n(.*?)\n---\n", re.S)
+KEY_LINE = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*):\s*(.*)$", re.M)
+KNOWN_SKILL_KEYS = {"name", "description", "allowed-tools", "disable-model-invocation",
+                    "user-invocable", "license", "metadata", "compatibility"}
+TEXT_EXT = (".md", ".json", ".py", ".txt", ".yaml", ".yml", "")
+
+
+def candidate_secrets(path):
+    """Pull plausible secret values out of the credential file without hardcoding any."""
+    if not path or not os.path.isfile(path):
+        return []
+    out = set()
+    for line in open(path, encoding="utf-8", errors="replace"):
+        # key: value, and ${VAR:-default} shapes
+        m = re.match(r"\s*[\w ]*(?:password|pwd|psw|secret|token|uid|username|user name)\s*:\s*(.+)",
+                     line, re.I)
+        if m:
+            v = m.group(1).strip().strip('"\'')
+            v = re.sub(r"^\$\{[^:}]+:-(.*)\}$", r"\1", v).strip()
+            if len(v) >= 5 and v.lower() not in ("none", "null", "true", "false"):
+                out.add(v)
+        for m2 in re.finditer(r"\$\{[A-Z_]*(?:PASSWORD|TOKEN|SECRET|UID)[A-Z_]*:-([^}]+)\}", line):
+            v = m2.group(1).strip()
+            if len(v) >= 5:
+                out.add(v)
+    return sorted(out, key=len, reverse=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="plugin-selfcheck", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ap.add_argument("--plugin", default=here)
+    ap.add_argument("--credentials",
+                    default=os.path.join(os.path.dirname(os.path.dirname(here)), "doc",
+                                         "credential.yaml"))
+    args = ap.parse_args()
+    R = args.plugin.rstrip("/")
+    repo = os.path.dirname(os.path.dirname(R))
+    errs, warns, notes = [], [], []
+
+    # ---- manifests
+    pj = os.path.join(R, ".claude-plugin", "plugin.json")
+    try:
+        pdoc = json.load(open(pj))
+        if "name" not in pdoc:
+            errs.append("plugin.json: missing 'name'")
+        notes.append("plugin.json: name=%s version=%s" % (pdoc.get("name"), pdoc.get("version")))
+    except Exception as e:
+        errs.append("plugin.json: %s" % e)
+        pdoc = {}
+
+    mkp = os.path.join(repo, ".claude-plugin", "marketplace.json")
+    if os.path.isfile(mkp):
+        try:
+            mk = json.load(open(mkp))
+            for k in ("name", "owner", "plugins"):
+                if k not in mk:
+                    errs.append("marketplace.json: missing %r" % k)
+            for e in mk.get("plugins", []):
+                src = e.get("source")
+                if isinstance(src, str) and src.startswith("./"):
+                    d = os.path.join(repo, src)
+                    if not os.path.isdir(d):
+                        errs.append("marketplace source %s does not exist" % src)
+                    elif not os.path.isfile(os.path.join(d, ".claude-plugin", "plugin.json")):
+                        errs.append("marketplace source %s has no plugin.json" % src)
+                if e.get("name") and pdoc.get("name") and e["name"] != pdoc["name"]:
+                    warns.append("marketplace entry name %r != plugin.json name %r"
+                                 % (e["name"], pdoc["name"]))
+            notes.append("marketplace.json: %d plugin entry(ies)" % len(mk.get("plugins", [])))
+        except Exception as e:
+            errs.append("marketplace.json: %s" % e)
+    else:
+        warns.append("no marketplace.json at %s" % mkp)
+
+    # ---- skills
+    skills = sorted(glob.glob(os.path.join(R, "skills", "*", "SKILL.md")))
+    if not skills:
+        errs.append("no skills found")
+    for s in skills:
+        d = os.path.basename(os.path.dirname(s))
+        body = open(s, encoding="utf-8").read()
+        m = FRONTMATTER.match(body)
+        if not m:
+            errs.append("%s: no YAML frontmatter" % d)
+            continue
+        fm = m.group(1)
+        keys = dict(KEY_LINE.findall(fm))
+        cont = [l for l in fm.split("\n") if l.strip() and not KEY_LINE.match(l)]
+        if cont:
+            errs.append("%s: frontmatter has a continuation line - description must be one line "
+                        "(%r)" % (d, cont[0][:60]))
+        name, desc = keys.get("name", "").strip(), keys.get("description", "").strip()
+        if not name:
+            errs.append("%s: frontmatter has no 'name'" % d)
+        elif name != d:
+            errs.append("%s: frontmatter name %r does not match directory" % (d, name))
+        if not desc:
+            errs.append("%s: frontmatter has no 'description'" % d)
+        elif len(desc) < 120:
+            warns.append("%s: description is only %d chars - it is how the skill gets selected, so "
+                         "name concrete triggers" % (d, len(desc)))
+        unknown = set(keys) - KNOWN_SKILL_KEYS
+        if unknown:
+            warns.append("%s: unrecognised frontmatter key(s) %s" % (d, sorted(unknown)))
+
+        for link in re.findall(r"\]\((references/[^)#]+)\)", body):
+            if not os.path.isfile(os.path.join(os.path.dirname(s), link)):
+                errs.append("%s: links to missing %s" % (d, link))
+        for tool in sorted(set(re.findall(r"CLAUDE_PLUGIN_ROOT\}/bin/([A-Za-z0-9_.-]+)", body))):
+            if not os.path.isfile(os.path.join(R, "bin", tool)):
+                errs.append("%s: references bin/%s which does not exist" % (d, tool))
+        nlines = body.count("\n") + 1
+        if nlines > 500:
+            warns.append("%s: SKILL.md is %d lines; keep it under 500 and push detail into "
+                         "references/" % (d, nlines))
+        notes.append("skill %-22s desc=%3dch body=%3d lines refs=%d"
+                     % (d, len(desc), nlines,
+                        len(glob.glob(os.path.join(os.path.dirname(s), "references", "*.md")))))
+
+    # ---- agents
+    for a in sorted(glob.glob(os.path.join(R, "agents", "*.md"))):
+        m = FRONTMATTER.match(open(a, encoding="utf-8").read())
+        if not m:
+            errs.append("agent %s: no frontmatter" % os.path.basename(a))
+            continue
+        keys = dict(KEY_LINE.findall(m.group(1)))
+        if not keys.get("description"):
+            errs.append("agent %s: no description" % os.path.basename(a))
+        notes.append("agent %s: ok" % os.path.basename(a))
+
+    # ---- bundled scripts
+    for t in sorted(glob.glob(os.path.join(R, "bin", "*"))) + \
+             sorted(glob.glob(os.path.join(R, "hooks", "*.py"))):
+        if not os.path.isfile(t):
+            continue
+        # Compile in-process. py_compile would write __pycache__ into the plugin we are about
+        # to ship, whatever PYTHONDONTWRITEBYTECODE says.
+        try:
+            compile(open(t, encoding="utf-8").read(), t, "exec")
+        except SyntaxError as e:
+            errs.append("%s does not compile: line %s: %s"
+                        % (os.path.relpath(t, R), e.lineno, e.msg))
+        except (OSError, UnicodeDecodeError) as e:
+            errs.append("%s is unreadable: %s" % (os.path.relpath(t, R), e))
+        # A leading underscore marks a shared module rather than a CLI entry point, so it is
+        # imported, never executed, and does not need the executable bit.
+        leaf = os.path.basename(t)
+        if (os.path.dirname(t).endswith("bin") and not leaf.startswith("_")
+                and not os.access(t, os.X_OK)):
+            errs.append("%s is not executable" % os.path.relpath(t, R))
+
+    # ---- every json parses
+    for j in glob.glob(os.path.join(R, "**", "*.json"), recursive=True):
+        try:
+            json.load(open(j))
+        except Exception as e:
+            errs.append("%s: %s" % (os.path.relpath(j, R), e))
+
+    # ---- files that hold secrets must be gitignored before anyone pushes this to a shared remote
+    gi = os.path.join(repo, ".gitignore")
+    MUST_IGNORE = ["automation.local.yaml", "doc/credential.yaml"]
+    if os.path.isfile(gi):
+        pats = [l.strip() for l in open(gi) if l.strip() and not l.startswith("#")]
+        for target in MUST_IGNORE:
+            leaf = target.split("/")[-1]
+            if not any(p in (target, leaf) or p.rstrip("/") in (target, leaf) for p in pats):
+                errs.append("%s is NOT in .gitignore. It holds credentials and must never be "
+                            "committed." % target)
+        notes.append(".gitignore: covers %d secret-bearing path(s)" % len(MUST_IGNORE))
+    else:
+        warns.append("no .gitignore at the repo root - add one before pushing to a shared remote")
+    for target in MUST_IGNORE:
+        p = os.path.join(repo, target)
+        if os.path.isfile(p):
+            notes.append("%s exists locally (gitignored, not scanned - it is meant to hold secrets)"
+                         % target)
+
+    # ---- no credential from the credential file leaked into anything committed
+    secrets = candidate_secrets(args.credentials)
+    if not secrets:
+        warns.append("no credential file found at %s - secret scan skipped" % args.credentials)
+    else:
+        scanned = 0
+        for f in glob.glob(os.path.join(R, "**", "*"), recursive=True) + \
+                 glob.glob(os.path.join(repo, "*.md")):
+            if not os.path.isfile(f) or os.path.splitext(f)[1] not in TEXT_EXT:
+                continue
+            try:
+                txt = open(f, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                continue
+            scanned += 1
+            for sec in secrets:
+                if sec in txt:
+                    errs.append("%s contains a value from the credential file (%d chars, "
+                                "not reproduced here)" % (os.path.relpath(f, repo), len(sec)))
+                    break
+        notes.append("secret scan: %d candidate value(s) checked against %d file(s)"
+                     % (len(secrets), scanned))
+
+    # ---- defer to the official validator when the CLI is present. It checks manifest fields this
+    # script does not know about, and it is the authority on schema changes.
+    import shutil
+    import subprocess
+    if shutil.which("claude"):
+        r = subprocess.run(["claude", "plugin", "validate", R],
+                           capture_output=True, text=True, timeout=120)
+        blob = (r.stdout or "") + (r.stderr or "")
+        offending = [l.strip() for l in blob.splitlines() if l.strip().startswith("❯")]
+        if "Validation failed" in blob or "error" in blob.lower() and offending:
+            for l in offending:
+                errs.append("claude plugin validate: %s" % l.lstrip("❯ "))
+        elif offending:
+            for l in offending:
+                warns.append("claude plugin validate: %s" % l.lstrip("❯ "))
+        notes.append("claude plugin validate: %s"
+                     % ("passed" if "passed" in blob else "see findings above"))
+    else:
+        warns.append("the `claude` CLI is not on PATH, so the official plugin validator was not "
+                     "run. Install it and re-run to check manifest fields this script does not.")
+
+    for n in notes:
+        print("  " + n)
+    print("\n%s\nERRORS   %d" % ("=" * 66, len(errs)))
+    for e in errs:
+        print("  ERR  " + e)
+    print("WARNINGS %d" % len(warns))
+    for w in warns:
+        print("  warn " + w)
+    return 1 if errs else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

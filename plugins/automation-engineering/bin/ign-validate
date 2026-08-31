@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+"""ign-validate - pre-flight an on-disk Ignition project.
+
+The Gateway importer SILENTLY DROPS malformed resources. A single unparseable JSON, a payload file
+named something the resource type does not expect, or a resource.json in the wrong folder means the
+view/query/script just does not appear after import, with no error anywhere.
+
+Every check here corresponds to a defect actually found in this estate, not a hypothetical.
+Zero dependencies (stdlib only).
+
+    ign-validate <project-dir> [<project-dir> ...]
+    ign-validate --all <backup>/projects        # every project under a directory
+    ign-validate <dir> --json
+
+Exit status: 0 clean or warnings only, 1 errors found, 2 bad usage.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+
+# Payload filename is fixed by the resource type, not chosen by the author. Renaming it in
+# resource.json files[] does not make Ignition read it (see Martillac-Alarms session-props).
+FIXED_PAYLOAD = {
+    "com.inductiveautomation.perspective/views": ["view.json"],
+    "com.inductiveautomation.perspective/style-classes": ["style.json"],
+    "com.inductiveautomation.perspective/page-config": ["config.json"],
+    "com.inductiveautomation.perspective/session-props": ["props.json"],
+    "com.inductiveautomation.perspective/stylesheet": ["stylesheet.css"],
+    "ignition/named-query": ["query.sql"],
+    "ignition/script-python": ["code.py"],
+    "ignition/timer": ["handleTimerEvent.py"],
+    "ignition/startup": ["onStartup.py"],
+    "ignition/shutdown": ["onShutdown.py"],
+    "ignition/update": ["onUpdate.py"],
+    "com.inductiveautomation.sfc/charts": ["sfc.xml"],
+    "com.inductiveautomation.mcp/tools": ["onToolCalled.py"],
+}
+
+# scope is consistent per resource type across all 3830 resource.json in this estate.
+EXPECTED_SCOPE = {
+    "ignition/named-query": "DG",
+    "ignition/global-props": "A",
+    "com.inductiveautomation.reporting/reports": "A",
+    "com.inductiveautomation.perspective/views": "G",
+    "com.inductiveautomation.perspective/style-classes": "G",
+    "com.inductiveautomation.perspective/page-config": "G",
+    "com.inductiveautomation.perspective/session-props": "G",
+    "com.inductiveautomation.sfc/charts": "G",
+    "com.inductiveautomation.mcp/tools": "G",
+    "ignition/timer": "G",
+}
+
+RESOURCE_JSON_KEYS = {"scope", "version", "restricted", "overridable", "files", "attributes"}
+CONFLICT_RE = re.compile(r"^(<{7} |={7}$|>{7} )", re.M)
+VIEW_REQUIRED = {"custom", "params", "props", "root"}
+KNOWN_BINDING_TYPES = {"expr", "property", "tag", "query", "tag-history", "expr-struct"}
+KNOWN_TRANSFORMS = {"script", "expression", "format", "map"}
+MODULE_DIRS = ("ignition", "com.inductiveautomation.perspective", "com.inductiveautomation.sfc",
+               "com.inductiveautomation.webdev", "com.inductiveautomation.reporting",
+               "com.inductiveautomation.alarm-notification", "com.inductiveautomation.vision",
+               "com.inductiveautomation.mcp", "com.inductiveautomation.eventstream",
+               "com.inductiveautomation.sqlbridge")
+
+
+class Report(object):
+    def __init__(self):
+        self.rows = []
+
+    def add(self, level, path, msg):
+        self.rows.append({"level": level, "path": path, "message": msg})
+
+    error = lambda self, p, m: self.add("ERROR", p, m)
+    warn = lambda self, p, m: self.add("WARN", p, m)
+    note = lambda self, p, m: self.add("NOTE", p, m)
+
+    @property
+    def errors(self):
+        return [r for r in self.rows if r["level"] == "ERROR"]
+
+
+def rel_type(project, resdir):
+    """Map a resource directory to '<module>/<type>' regardless of nesting depth."""
+    parts = os.path.relpath(resdir, project).split(os.sep)
+    if len(parts) < 2:
+        return None
+    return "%s/%s" % (parts[0], parts[1])
+
+
+def load_json(path, rep):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        rep.error(path, "unreadable: %s" % e)
+        return None
+    if not raw.strip():
+        rep.error(path, "empty file - the Gateway will drop this resource")
+        return None
+    if CONFLICT_RE.search(raw.decode("utf-8", "replace")):
+        rep.error(path, "contains git conflict markers")
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        rep.error(path, "does not parse as JSON: %s" % e)
+        return None
+
+
+def check_resource_json(project, resdir, rep):
+    rj = os.path.join(resdir, "resource.json")
+    doc = load_json(rj, rep)
+    if doc is None or not isinstance(doc, dict):
+        if isinstance(doc, list):
+            rep.error(rj, "is a JSON array; resource.json must be an object")
+        return
+    rtype = rel_type(project, resdir)
+
+    stray = set(doc) - RESOURCE_JSON_KEYS
+    if stray:
+        # Real defect: FLEX01-R8-320-3-1 script-python has a top-level lastModification holding
+        # epoch millis alongside the correct ISO one inside attributes.
+        rep.warn(rj, "unexpected top-level key(s) %s - the only valid keys are %s"
+                 % (sorted(stray), sorted(RESOURCE_JSON_KEYS)))
+    for k in ("scope", "files", "attributes"):
+        if k not in doc:
+            rep.error(rj, "missing required key %r" % k)
+
+    if rtype == "ignition/named-query" and doc.get("version") != 2:
+        rep.error(rj, "named-query resources must have version 2, found %r" % doc.get("version"))
+    elif rtype != "ignition/named-query" and "version" in doc and doc["version"] != 1:
+        rep.warn(rj, "version is %r; every type except ignition/named-query uses 1" % doc["version"])
+
+    want_scope = EXPECTED_SCOPE.get(rtype)
+    if want_scope and doc.get("scope") not in (None, want_scope):
+        rep.warn(rj, "scope %r; every %s in this estate uses %r"
+                 % (doc.get("scope"), rtype, want_scope))
+
+    attrs = doc.get("attributes")
+    if isinstance(attrs, dict):
+        sig = attrs.get("lastModificationSignature")
+        if sig:
+            rep.note(rj, "carries a lastModificationSignature. It is NOT a content hash and the "
+                         "Gateway recomputes it - prefer omitting it when authoring.")
+        lm = attrs.get("lastModification")
+        if isinstance(lm, dict) and isinstance(lm.get("timestamp"), (int, float)):
+            rep.warn(rj, "attributes.lastModification.timestamp is a number; it must be an ISO 8601 "
+                         "string like 2026-08-25T10:22:18Z")
+    elif attrs is not None:
+        rep.error(rj, "attributes must be an object, found %s" % type(attrs).__name__)
+
+    files = doc.get("files")
+    if not isinstance(files, list):
+        if files is not None:
+            rep.error(rj, "files must be an array")
+        return
+
+    on_disk = set(os.listdir(resdir)) - {"resource.json"}
+    on_disk = {f for f in on_disk if os.path.isfile(os.path.join(resdir, f))}
+    declared = set(f for f in files if isinstance(f, str))
+
+    for f in sorted(declared - on_disk):
+        rep.error(rj, "files[] declares %r but it is not on disk" % f)
+    for f in sorted(on_disk - declared):
+        if f.endswith((".orig", ".bak", ".rej", ".tmp")) or f.startswith("."):
+            rep.warn(os.path.join(resdir, f), "leftover file - remove before packaging")
+        else:
+            rep.warn(rj, "%r is on disk but not declared in files[]; it will be ignored" % f)
+
+    expected = FIXED_PAYLOAD.get(rtype)
+    if expected:
+        want = expected[0]
+        if want not in declared and want not in on_disk:
+            rep.error(rj, "%s resources must carry %r; found %s. The payload filename is fixed by "
+                          "the resource type - renaming it in files[] does not work."
+                      % (rtype, want, sorted(on_disk) or "nothing"))
+        elif want not in declared and want in on_disk:
+            rep.error(rj, "%r exists on disk but files[] does not declare it, so it is ignored" % want)
+
+
+def check_view(path, rep):
+    doc = load_json(path, rep)
+    if not isinstance(doc, dict):
+        return
+    missing = VIEW_REQUIRED - set(doc)
+    if missing:
+        rep.error(path, "view.json is missing always-present key(s) %s" % sorted(missing))
+    unknown = set(doc) - (VIEW_REQUIRED | {"propConfig", "events", "permissions"})
+    if unknown:
+        rep.warn(path, "unrecognised top-level key(s) %s" % sorted(unknown))
+
+    def walk(node, where):
+        if not isinstance(node, dict):
+            return
+        # A binding placed inside props instead of the sibling propConfig map is the most common
+        # structural mistake and fails silently - the prop keeps its static value.
+        props = node.get("props")
+        if isinstance(props, dict):
+            for k, v in props.items():
+                if isinstance(v, dict) and ("binding" in v or v.get("type") in KNOWN_BINDING_TYPES):
+                    rep.error(path, "%s: props.%s looks like a binding. Bindings belong in the "
+                                    "sibling propConfig map keyed \"props.%s\", not inside props."
+                              % (where, k, k))
+        pc = node.get("propConfig")
+        if isinstance(pc, dict):
+            for key, cfg in pc.items():
+                if not isinstance(cfg, dict):
+                    continue
+                b = cfg.get("binding")
+                if isinstance(b, dict):
+                    bt = b.get("type")
+                    if bt and bt not in KNOWN_BINDING_TYPES:
+                        rep.warn(path, "%s: propConfig[%r] binding type %r is not one of the six "
+                                       "used in this estate %s" % (where, key, bt,
+                                                                   sorted(KNOWN_BINDING_TYPES)))
+                    for t in b.get("transforms") or []:
+                        if isinstance(t, dict) and t.get("type") not in KNOWN_TRANSFORMS:
+                            rep.warn(path, "%s: propConfig[%r] transform type %r is unknown"
+                                     % (where, key, t.get("type")))
+                    cf = b.get("config") or {}
+                    if bt == "tag" and cf.get("mode") == "indirect":
+                        refs = cf.get("references") or {}
+                        used = set(re.findall(r"\{(\d+)\}", str(cf.get("tagPath", ""))))
+                        for n in sorted(used - set(refs)):
+                            rep.error(path, "%s: indirect tagPath uses {%s} but references has no "
+                                            "%r entry" % (where, n, n))
+        ev = node.get("events")
+        if isinstance(ev, dict):
+            for cat in ev:
+                if cat not in ("dom", "component", "system"):
+                    rep.warn(path, "%s: events category %r is not dom/component/system"
+                             % (where, cat))
+        for i, ch in enumerate(node.get("children") or []):
+            nm = (ch.get("meta") or {}).get("name") if isinstance(ch, dict) else None
+            walk(ch, "%s/%s" % (where, nm or "[%d]" % i))
+
+    walk(doc.get("root") or {}, "root")
+
+
+def check_named_query(resdir, rep):
+    rj = os.path.join(resdir, "resource.json")
+    sql_path = os.path.join(resdir, "query.sql")
+    doc = load_json(rj, rep) if os.path.isfile(rj) else None
+    if not isinstance(doc, dict) or not os.path.isfile(sql_path):
+        return
+    attrs = doc.get("attributes") or {}
+    params = attrs.get("parameters") or []
+    try:
+        with open(sql_path, encoding="utf-8", errors="replace") as f:
+            sql = f.read()
+    except OSError:
+        return
+    if "?" in re.sub(r"'[^']*'", "", sql):
+        rep.error(sql_path, "contains a JDBC '?' placeholder. Named queries in this estate always "
+                            "use :paramName colon markers; zero of 315 use '?'.")
+    for p in params:
+        if not isinstance(p, dict):
+            continue
+        ident = p.get("identifier")
+        if ident and not re.search(r":%s\b" % re.escape(str(ident)), sql):
+            rep.warn(sql_path, "declares parameter %r but :%s never appears in the SQL"
+                     % (ident, ident))
+        st = p.get("sqlType")
+        if isinstance(st, int) and st not in (2, 3, 5, 6, 7, 8):
+            rep.warn(rj, "parameter %r sqlType %d is outside the set used here "
+                         "(7=String 8=DateTime 5=Float8 3=Int8 2=Int4 6=Boolean). Note sqlType is "
+                         "Ignition's DataType ordinal, NOT java.sql.Types." % (ident, st))
+    for m in re.finditer(r"(?<![:\w]):([A-Za-z_]\w*)", sql):
+        if m.group(1) not in {str(p.get("identifier")) for p in params if isinstance(p, dict)}:
+            rep.error(sql_path, "SQL binds :%s but resource.json declares no such parameter"
+                      % m.group(1))
+
+
+def check_data_bin(path, rep):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(2)
+    except OSError:
+        return
+    if head == b"\x1f\x8b":
+        rep.note(path, "gzipped Java serialization - never hand-edit")
+    elif head[:1] == b"{":
+        rep.note(path, "plain JSON data.bin - safe to edit")
+    elif head:
+        rep.warn(path, "data.bin is neither gzip (0x1f8b) nor JSON ('{') - starts %r" % head)
+
+
+def check_python(path, rep):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            src = f.read()
+    except OSError:
+        return
+    for m in re.finditer(r"""(?<![\w])(?:f"|f')""", src):
+        line = src.count("\n", 0, m.start()) + 1
+        rep.error(path, "line %d: f-string. Project scripts run on Jython 2.7, which has none." % line)
+        break
+    if re.search(r"^\s*print\s*\([^)]*,", src, re.M):
+        rep.warn(path, "print(a, b) prints a tuple under Jython 2.7's print statement")
+    if re.search(r"\bexcept\s+Exception\b", src) and "java.lang" not in src:
+        rep.note(path, "catches 'except Exception' with no java.lang.Exception handler. Java "
+                       "exceptions escape it - the estate's idiom also catches java.lang.Exception.")
+
+
+def validate_project(project, rep):
+    if not os.path.isfile(os.path.join(project, "project.json")):
+        rep.error(project, "no project.json - not an Ignition project directory")
+        return
+    pj = load_json(os.path.join(project, "project.json"), rep)
+    if isinstance(pj, dict):
+        stray = set(pj) - {"title", "description", "enabled", "inheritable", "parent"}
+        if stray:
+            rep.warn(os.path.join(project, "project.json"),
+                     "unexpected key(s) %s; project.json has exactly five fields" % sorted(stray))
+        parent = pj.get("parent") or ""
+        if parent:
+            sib = os.path.join(os.path.dirname(os.path.abspath(project)), parent)
+            ppj = os.path.join(sib, "project.json")
+            if not os.path.isdir(sib):
+                rep.warn(project, "parent %r is not a sibling directory here (cannot verify)" % parent)
+            else:
+                pdoc = load_json(ppj, rep) if os.path.isfile(ppj) else None
+                if isinstance(pdoc, dict) and not pdoc.get("inheritable"):
+                    rep.error(project, "parent %r has inheritable:false, so this project cannot "
+                                       "inherit from it" % parent)
+
+    for dirpath, dirnames, filenames in os.walk(project):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "__pycache__")]
+        rt = rel_type(project, dirpath)
+
+        # A resource.json directly under a module folder is almost always a misplaced resource
+        # (real case: FLEX01 declared stylesheet.css at perspective/ level instead of
+        # perspective/stylesheet/).
+        if "resource.json" in filenames:
+            parts = os.path.relpath(dirpath, project).split(os.sep)
+            if len(parts) == 1 and parts[0] in MODULE_DIRS:
+                rep.error(os.path.join(dirpath, "resource.json"),
+                          "resource.json sits directly under the module folder %r. It belongs in a "
+                          "resource-type subfolder." % parts[0])
+            check_resource_json(project, dirpath, rep)
+            if rt == "ignition/named-query":
+                check_named_query(dirpath, rep)
+
+        for fn in filenames:
+            full = os.path.join(dirpath, fn)
+            if os.path.islink(full) or not os.path.isfile(full):
+                continue
+            if fn == "view.json":
+                check_view(full, rep)
+            elif fn == "data.bin":
+                check_data_bin(full, rep)
+            elif fn.endswith(".py"):
+                # Only .py that the gateway actually executes runs on Jython. Loose helper
+                # scripts dropped at a project root are developer tooling the gateway ignores
+                # (real case: PT_Opt/remove_status_bar.py, Python 3, declared by no resource.json).
+                if rt in FIXED_PAYLOAD or rt == "com.inductiveautomation.webdev/resources":
+                    check_python(full, rep)
+                elif os.path.dirname(full) == project:
+                    rep.note(full, "loose .py at the project root - not a declared resource, so "
+                                   "the gateway never runs it. Jython rules do not apply.")
+            elif fn.endswith(".json") and fn != "resource.json":
+                load_json(full, rep)
+            elif fn.endswith((".orig", ".rej")):
+                rep.warn(full, "merge leftover - remove before packaging")
+            if os.path.getsize(full) == 0 and fn != "resource.json":
+                rep.warn(full, "zero bytes")
+
+        # Real trap: DEV LF_Parent_2 has query.sql and resource.json as empty DIRECTORIES.
+        for d in dirnames:
+            if d in ("resource.json", "view.json", "query.sql", "code.py"):
+                rep.error(os.path.join(dirpath, d),
+                          "%r is a DIRECTORY where a file is required (open() will fail)" % d)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="ign-validate", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("paths", nargs="+")
+    ap.add_argument("--all", action="store_true",
+                    help="treat each path as a directory OF projects")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--quiet", action="store_true", help="errors only")
+    args = ap.parse_args()
+
+    projects = []
+    for p in args.paths:
+        if args.all:
+            if not os.path.isdir(p):
+                sys.stderr.write("ign-validate: %s is not a directory\n" % p)
+                return 2
+            projects += [os.path.join(p, d) for d in sorted(os.listdir(p))
+                         if os.path.isfile(os.path.join(p, d, "project.json"))]
+        else:
+            projects.append(p)
+    if not projects:
+        sys.stderr.write("ign-validate: no Ignition projects found\n")
+        return 2
+
+    all_rows, n_err = [], 0
+    for proj in projects:
+        rep = Report()
+        validate_project(proj, rep)
+        rows = rep.errors if args.quiet else rep.rows
+        n_err += len(rep.errors)
+        if args.json:
+            all_rows += [dict(r, project=os.path.basename(proj.rstrip("/"))) for r in rows]
+            continue
+        if not rows:
+            if not args.quiet:
+                print("OK   %s" % proj)
+            continue
+        print("\n=== %s" % proj)
+        for r in rows:
+            print("%-5s %s\n      %s" % (r["level"], os.path.relpath(r["path"], proj)
+                                         if r["path"].startswith(proj) else r["path"],
+                                         r["message"]))
+    if args.json:
+        print(json.dumps(all_rows, indent=2))
+    else:
+        print("\n%d project(s), %d error(s)" % (len(projects), n_err))
+    return 1 if n_err else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ignition": {
+      "type": "http",
+      "url": "${user_config.dev_gateway_url}/data/mcp/MCP_Tools",
+      "headers": {
+        "X-Ignition-API-Token": "${user_config.ign_api_token}",
+        "Accept": "application/json, text/event-stream"
+      }
+    }
+  }
+}

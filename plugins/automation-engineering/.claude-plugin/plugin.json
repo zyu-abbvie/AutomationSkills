@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "automation-engineering",
+  "displayName": "Automation Engineering",
+  "version": "1.0.0",
+  "description": "Working toolkit and local reference for this estate's automation projects: Ignition (Perspective, tags, UDTs, scripts, gateway resources, historian), Node-RED flows, and the MQTT + SQL layers that connect them. Includes live gateway and broker tooling, cross-platform triage playbooks, and the shared pitfall knowledge base.",
+  "keywords": [
+    "ignition",
+    "perspective",
+    "node-red",
+    "mqtt",
+    "sparkplug",
+    "sql-historian",
+    "lab-automation",
+    "scada",
+    "equipment-integration",
+    "troubleshooting"
+  ],
+  "author": {
+    "name": "Lab Automation Engineering"
+  },
+  "repository": "git@github.com:zyu-abbvie/AutomationSkills.git",
+  "license": "UNLICENSED",
+  "userConfig": {
+    "dev_gateway_url": {
+      "type": "string",
+      "title": "Dev Ignition gateway URL",
+      "description": "Base URL of the non-production gateway that exposes the HTTP API and MCP server. This is the only gateway you can drive programmatically.",
+      "default": "http://wa03593d:8088",
+      "required": false
+    },
+    "prod_gateway_hosts": {
+      "type": "string",
+      "title": "Production gateway hostnames",
+      "description": "Comma-separated hostnames to treat as production. The bundled tooling refuses to send writes to these.",
+      "default": "wz02163d",
+      "required": false
+    },
+    "ign_api_token": {
+      "type": "string",
+      "title": "Ignition API token",
+      "description": "Required only for WRITE operations and for the MCP server. Reads on the dev gateway work anonymously. Create one under Config > Security > API Tokens.",
+      "sensitive": true,
+      "required": false
+    },
+    "mqtt_host": {
+      "type": "string",
+      "title": "MQTT broker host",
+      "description": "Broker for connectivity checks and topic discovery.",
+      "default": "10.72.167.253",
+      "required": false
+    },
+    "mqtt_username": {
+      "type": "string",
+      "title": "MQTT username",
+      "description": "Broker username. Leave blank to connect anonymously.",
+      "required": false
+    },
+    "mqtt_password": {
+      "type": "string",
+      "title": "MQTT password",
+      "description": "Broker password, paired with the username above.",
+      "sensitive": true,
+      "required": false
+    }
+  }
+}
