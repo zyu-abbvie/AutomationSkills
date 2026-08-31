@@ -242,7 +242,7 @@ See the `equipment-onboarding` skill for the parts common to every equipment typ
 
 ## When something is wrong
 
-[references/troubleshooting.md](references/troubleshooting.md) has ordered playbooks. The fast triage:
+The fast triage:
 
 | Symptom | Look first at |
 |---|---|
@@ -263,7 +263,6 @@ Designer or a Perspective session, not from `ign`.
 - [references/tag-model.md](references/tag-model.md) — all 41 tags, units, physical meaning, expressions
 - [references/unit-operations.md](references/unit-operations.md) — the six SFC charts step by step
 - [references/instrument-layer.md](references/instrument-layer.md) — balances, transducer, pumps, the RIO flow
-- [references/troubleshooting.md](references/troubleshooting.md) — ordered debug playbooks
 
 Related skills: `mqtt-integration` for the topic layer, `ignition-resources` for authoring,
 `sql-historian` for trends and batch history, `triage` for faults that are not TFF-specific.
