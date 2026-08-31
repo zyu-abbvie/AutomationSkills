@@ -7,8 +7,8 @@ in the two gateway backups. Read this before hand-authoring or patching a view.
 Path shorthand used throughout (both read-only):
 
 ```bash
-DEV=/home/admin/src/Automation_Skills2/doc/Ignition-WA03593D_Ignition-backup-20260828-1312/projects
-PROD=/home/admin/src/Automation_Skills2/doc/Ignition-WZ02163D_Ignition-backup-20260828-1137/projects
+DEV=$DEV
+PROD=$PROD
 ```
 
 ## Get this wrong and nothing happens: bindings do not live next to the prop

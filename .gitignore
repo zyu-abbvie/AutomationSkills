@@ -13,3 +13,8 @@ doc/
 
 __pycache__/
 *.pyc
+
+# Build working notes and internal findings. These belong with the estate owners,
+# not in a published repository.
+PROPOSED_PITFALLS.md
+*.local.md

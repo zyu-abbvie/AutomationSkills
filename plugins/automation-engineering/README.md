@@ -11,17 +11,18 @@ environment-specific, the skill says which environment.
 ## Install
 
 ```
-/plugin marketplace add /home/admin/src/Automation_Skills2
+/plugin marketplace add zyu-abbvie/AutomationSkills
 /plugin install automation-engineering@automation-engineering-marketplace
 ```
 
-For a whole team, commit this to `.claude/settings.json` in the shared repo instead:
+To have it register automatically for everyone who clones a project, put this in that project's
+`.claude/settings.json`:
 
 ```json
 {
   "extraKnownMarketplaces": {
     "automation-engineering-marketplace": {
-      "source": { "source": "github", "repo": "<your-org>/<this-repo>" }
+      "source": { "source": "github", "repo": "zyu-abbvie/AutomationSkills" }
     }
   },
   "enabledPlugins": {
@@ -29,6 +30,9 @@ For a whole team, commit this to `.claude/settings.json` in the shared repo inst
   }
 }
 ```
+
+That also enables the bundled `PreToolUse` hook and the Ignition MCP server for anyone who trusts
+the project, so agree it with the team before committing it.
 
 ## Configure
 

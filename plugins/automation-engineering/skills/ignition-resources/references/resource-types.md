@@ -2,8 +2,18 @@
 
 Every Ignition project resource type present in this estate: where its folder goes, what its payload
 file must be called, and what `resource.json` has to say about it. Counts are from the two backups
-under `/home/admin/src/Automation_Skills2/doc/` (DEV = WA03593D, 40 projects, 8.3.7; PROD = WZ02163D,
+under `$BACKUPS/` (DEV = WA03593D, 40 projects, 8.3.7; PROD = WZ02163D,
 114 projects, 8.1.28).
+
+> **Paths in this document.** `$DEV` and `$PROD` are the `projects/` directories inside an
+> Ignition gateway backup, `$NODERED` a directory of groov RIO device backups. Set them to wherever
+> you keep yours, or put `backups_dir` / `nodered_backups_dir` in `automation.local.yaml`:
+>
+> ```bash
+> DEV=<backups>/Ignition-<DEVHOST>_Ignition-backup-<stamp>/projects
+> PROD=<backups>/Ignition-<PRODHOST>_Ignition-backup-<stamp>/projects
+> NODERED=<backups>/backup_nodered
+> ```
 
 ## Four things that silently fail
 
@@ -132,7 +142,7 @@ Scope values — six exist, and each type uses one consistently:
 `attributes.hintScope` (e.g. `2`). Prefer `A` for a shared script library.
 
 `attributes` is type-specific. Fully-specified examples worth copying verbatim:
-`/home/admin/src/Automation_Skills2/doc/Ignition-WA03593D_Ignition-backup-20260828-1312/projects/Ruben-Test-App/ignition/named-query/GetImage/resource.json`
+`$DEV/Ruben-Test-App/ignition/named-query/GetImage/resource.json`
 (14-key named-query block: `useMaxReturnSize, autoBatchEnabled, fallbackValue, maxReturnSize,
 cacheUnit, type, enabled, cacheAmount, cacheEnabled, database, fallbackEnabled, permissions` plus the
 two `lastModification*` keys, plus optional `parameters`) and

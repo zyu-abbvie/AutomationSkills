@@ -4,6 +4,16 @@ The working contract for driving the DEV gateway (`http://wa03593d:8088`, Igniti
 `/data/api/v1`. Covers auth, the resources CRUD grammar, the read/write envelopes, the six ways this
 API fails silently at HTTP 200, and what it cannot do at all.
 
+> **Paths in this document.** `$DEV` and `$PROD` are the `projects/` directories inside an
+> Ignition gateway backup, `$NODERED` a directory of groov RIO device backups. Set them to wherever
+> you keep yours, or put `backups_dir` / `nodered_backups_dir` in `automation.local.yaml`:
+>
+> ```bash
+> DEV=<backups>/Ignition-<DEVHOST>_Ignition-backup-<stamp>/projects
+> PROD=<backups>/Ignition-<PRODHOST>_Ignition-backup-<stamp>/projects
+> NODERED=<backups>/backup_nodered
+> ```
+
 ## Auth: reads are open, writes are 401 with no body
 
 | Call | Result with no credentials | Notes |
@@ -256,7 +266,7 @@ skill that promises "read a tag over REST" is wrong. Providers on DEV: `default`
 `application/zip;charset=utf-8` (`Content-Disposition: attachment; filename="MCP_Tools_20260828154541.zip"`).
 It is **byte-stable**: three consecutive exports of `MCP_Tools` gave identical md5 `5906b5bc…`,
 80,031 bytes, 95 entries. The entry list is exactly the on-disk tree — 95 zip entries against 95 files
-under `/home/admin/src/Automation_Skills2/doc/Ignition-WA03593D_Ignition-backup-20260828-1312/projects/MCP_Tools/`,
+under `$DEV/MCP_Tools/`,
 same relative paths, including the stale nested `MCP_Tools/MCP_Tools/…` subtree that project carries.
 
 Take an export before every change — the cheapest rollback point available.

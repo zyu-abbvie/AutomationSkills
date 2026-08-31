@@ -13,6 +13,16 @@ broker `10.94.132.35` are all unreachable while `http://wa03593d:8088/system/gwi
 is routing, not a local fault. **All work here is offline, against `flows.json` inside a backup zip.** The
 Admin API section is what to do from a host that *does* have access.
 
+> **Paths in this document.** `$DEV` and `$PROD` are the `projects/` directories inside an
+> Ignition gateway backup, `$NODERED` a directory of groov RIO device backups. Set them to wherever
+> you keep yours, or put `backups_dir` / `nodered_backups_dir` in `automation.local.yaml`:
+>
+> ```bash
+> DEV=<backups>/Ignition-<DEVHOST>_Ignition-backup-<stamp>/projects
+> PROD=<backups>/Ignition-<PRODHOST>_Ignition-backup-<stamp>/projects
+> NODERED=<backups>/backup_nodered
+> ```
+
 ## What a device is, and what a backup holds
 
 Every backup is a **GRV-R7 groov RIO** (`info.json` → `deviceModel`), firmware 3.5.0 to 4.0.3 across the 17
@@ -34,7 +44,7 @@ Node-RED version is not determinable from a backup** — read it from `GET /sett
 
 ```bash
 unzip -o -q -x 'node-red/node_modules.tar.gz' \
-  '/home/admin/src/Automation_Skills2/doc/backup_nodered/LC_R8_320-3-1_TFF/'*.zip -d /tmp/nr/tff
+  '$NODERED/LC_R8_320-3-1_TFF/'*.zip -d /tmp/nr/tff
 ```
 
 `doc/backup_nodered/` has **37 directories and 181 zips, but only 17 directories contain a zip; 17 are
@@ -254,12 +264,12 @@ against the version in `GET /settings` first.
 
 ## Auto_NodeRed — the flow generator
 
-`/home/admin/src/Auto_NodeRed/` — "RIO Flow Automator": an Express + vanilla-JS SPA (1522 lines under
+`<Auto_NodeRed checkout>/` — "RIO Flow Automator": an Express + vanilla-JS SPA (1522 lines under
 `lib/`, one runtime dependency, `express`) that generates and deploys flows from an equipment spec instead
 of hand-wiring nodes in the editor.
 
 ```bash
-cd /home/admin/src/Auto_NodeRed && cp .env.example .env   # RIO_TOOL_TOKEN gates the API
+cd <Auto_NodeRed checkout> && cp .env.example .env   # RIO_TOOL_TOKEN gates the API
 npm install && npm start     # http://localhost:3000
 ./scripts/run.sh             # or Docker on host port 8090 (no compose plugin on this host)
 ```

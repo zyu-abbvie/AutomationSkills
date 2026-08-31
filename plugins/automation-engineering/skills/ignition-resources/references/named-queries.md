@@ -4,6 +4,16 @@ On-disk anatomy, parameter binding, and invocation of `ignition/named-query` res
 estate, measured over the 315 named queries in the DEV and PROD backups. Read this before you
 author, edit, or fan out a named query.
 
+> **Paths in this document.** `$DEV` and `$PROD` are the `projects/` directories inside an
+> Ignition gateway backup, `$NODERED` a directory of groov RIO device backups. Set them to wherever
+> you keep yours, or put `backups_dir` / `nodered_backups_dir` in `automation.local.yaml`:
+>
+> ```bash
+> DEV=<backups>/Ignition-<DEVHOST>_Ignition-backup-<stamp>/projects
+> PROD=<backups>/Ignition-<PRODHOST>_Ignition-backup-<stamp>/projects
+> NODERED=<backups>/backup_nodered
+> ```
+
 ## The four things people get wrong
 
 | Mistake | What actually happens | Do this instead |
@@ -29,7 +39,7 @@ named resource type.
 ## resource.json: the complete key set
 
 Real file, copied verbatim from
-`/home/admin/src/Automation_Skills2/doc/Ignition-WZ02163D_Ignition-backup-20260828-1137/projects/TFF_Parent/ignition/named-query/Get_Annotations/resource.json`:
+`$PROD/TFF_Parent/ignition/named-query/Get_Annotations/resource.json`:
 
 ```json
 {
@@ -239,7 +249,7 @@ gets it right (`ON sqlth_annotations.tagid = sqlth_te.id`), as does every `Get_A
 Always join `<other>.tagid = sqlth_te.id`. Copy the live SELECT, never the commented stub.
 
 **DEV LF_Parent_2 has named-query payloads that are empty DIRECTORIES.** In
-`/home/admin/src/Automation_Skills2/doc/Ignition-WA03593D_Ignition-backup-20260828-1312/projects/LF_Parent_2/ignition/named-query/`,
+`$DEV/LF_Parent_2/ignition/named-query/`,
 `Get_TagID`, `Get_AuditData`, and `Get_BatchStatus` each contain `query.sql/` and `resource.json/`
 as empty directories; `Get_Annotations` has `resource.json/` as a directory. Any tooling that globs
 and opens dies with `IsADirectoryError: [Errno 21] Is a directory`.

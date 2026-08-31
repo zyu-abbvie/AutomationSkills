@@ -6,8 +6,8 @@ Path shorthand used throughout (both are absolute roots):
 
 | Token | Expands to |
 |---|---|
-| `$DEV` | `/home/admin/src/Automation_Skills2/doc/Ignition-WA03593D_Ignition-backup-20260828-1312/projects` |
-| `$PROD` | `/home/admin/src/Automation_Skills2/doc/Ignition-WZ02163D_Ignition-backup-20260828-1137/projects` |
+| `$DEV` | `$DEV` |
+| `$PROD` | `$PROD` |
 
 ## Read this first
 
