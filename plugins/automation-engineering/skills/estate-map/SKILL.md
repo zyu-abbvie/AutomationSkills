@@ -154,6 +154,7 @@ Two things to know:
 
 | Task | Skill |
 |---|---|
+| Anything on a **TFF** skid — the estate's most standardised platform, 20 benches | `tff-platform` |
 | Author or edit views, scripts, named queries, tags, UDTs, SFCs | `ignition-resources` |
 | Drive a live gateway: API, MCP tools, scan, export/import | `ignition-gateway` |
 | Node-RED flows on groov RIO devices | `nodered-rio` |
