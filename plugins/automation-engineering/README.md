@@ -94,6 +94,7 @@ Then read the `estate-map` skill.
 |---|---|
 | `estate-map` | Orientation. The two gateways, the architecture, the addressing scheme, where everything lives. Read first. |
 | `tff-platform` | Tangential Flow Filtration: the 20-bench platform, its 41-tag process model with units and physical meaning, the six SFC unit operations, the instruments, and how to debug a run. |
+| `mix-system` | Continuous mixing: the LNP benches and the LAI/MSP instances that reuse the convention, the ratio and dilution setpoint maths, the command contract, and the addressing traps. |
 | `ignition-resources` | Authoring and editing views, scripts, named queries, tags, SFCs, inheritance — on disk. |
 | `ignition-gateway` | Driving a live gateway: HTTP API, MCP tools, logs, project scan, export/import. |
 | `nodered-rio` | Node-RED flows on the Opto 22 groov RIO edge devices. |
