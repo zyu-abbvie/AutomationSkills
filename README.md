@@ -7,8 +7,8 @@ for this estate's automation projects: **Ignition** and **Node-RED** as co-equal
 
 ## Install
 
-```
-/plugin marketplace add [zyu-abbvie/AutomationSkills](https://github.com/zyu-abbvie/AutomationSkills.git)
+``` config you git SSH or change to https first before execution. 
+/plugin marketplace add git@github.com:zyu-abbvie/AutomationSkills.git
 /plugin install automation-engineering@automation-engineering-marketplace
 ```
 
