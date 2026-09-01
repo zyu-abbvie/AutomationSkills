@@ -8,7 +8,7 @@ for this estate's automation projects: **Ignition** and **Node-RED** as co-equal
 ## Install
 
 ```
-/plugin marketplace add zyu-abbvie/AutomationSkills
+/plugin marketplace add [zyu-abbvie/AutomationSkills](https://github.com/zyu-abbvie/AutomationSkills.git)
 /plugin install automation-engineering@automation-engineering-marketplace
 ```
 
