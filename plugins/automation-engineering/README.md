@@ -15,8 +15,10 @@ because the rig is not yet connected to either gateway.
 
 ## Install
 
+Configure your git SSH access first, or change the URL to HTTPS before running this:
+
 ```
-/plugin marketplace add zyu-abbvie/AutomationSkills
+/plugin marketplace add git@github.com:zyu-abbvie/AutomationSkills.git
 /plugin install automation-engineering@automation-engineering-marketplace
 ```
 
