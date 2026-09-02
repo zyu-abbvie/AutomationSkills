@@ -187,9 +187,10 @@ The estate implements the rest of the TSWG line, and the optimizer, without this
 | Extruder + feeders + zones + pump + TCUs | dev `TSWG`, prod `Extruder-AP31-4-273`, `…_BO` | **real.** Thermo Fisher Process 11 via FINS-UDP; pump and TCUs over MQTT |
 | Bayesian optimizer | prod `Bayesian_Platform`, `BO_Parent`; dev `Bayesian_Platform_Alpha` | **real.** Meta's **Ax / BoTorch**, running *outside* Ignition, driven entirely over MQTT |
 | Design space | SQL table `bay_opt` on `SQLServer` | bounds only — **never results, never a PSD** |
-| The PSD input | `Page/BO`, a component named `PAT` labelled "PAT Feed" | **a text box.** `PSD_D50_um: float(self.getSibling("PAT").props.text)` |
+| The PSD input | `Page/BO`, a component named `PAT` labelled "PAT Feed" | **an unbound text box with a hardcoded default of `"12"`.** `PSD_D50_um: float(self.getSibling("PAT").props.text)` — so an untouched panel publishes 12 µm as a measurement |
+| Run metadata | prod `ExpMetadata` — 28 named queries, keyed `(userid, expid, ver)` | real, and **shares no key with the optimizer**, which tracks `session_name` + `trial_index` in MQTT JSON. Nothing joins them |
 | Landing pad for this rig | dev `[MQTT Engine]pat/psd/{heartbeat,metrics}` | provisioned, **String, read-only, and referenced by nothing** |
-| Any other particle instrument | prod `[default]PAT/FBRM_from_OPC` (Mettler-Toledo **iC FBRM**, chord length) | real, 68 tags, but on a **different bench** (`SM_DPD_microsphere`). **No TSWG or BO resource references it** |
+| Any other particle instrument | prod `[default]PAT/FBRM_from_OPC` (Mettler-Toledo **iC FBRM**, chord length) | real, but on a **different site and a different process** — `SM_DPD_microsphere`, `IRVINE/RD3/2209H`, LAI microspheres. **No TSWG or BO resource references it** |
 
 The optimizer's decision variables are **screw speed (50–300 RPM), liquid feed rate (1–10 mL/min), powder
 feed rate (10–50 g/min)**, and its objective is **PSD D50 in the 40–50 µm band**. All three parameters
@@ -208,7 +209,7 @@ column or named query in either gateway.** Here is where each one lives — or d
 | Item | In `pat+gv` |
 |---|---|
 | Run ID | `runs.run_id` in `data/runs.db`, and `pat/psd/run/status` |
-| Sample ID | **no home.** `runs.name` / `notes` is the only free text |
+| Sample ID | **no home** in `pat+gv` — `runs.name`/`notes` is the only free text. The estate *does* have `ExpMetadata` keyed `(userid, expid, ver)`, but the optimizer shares no key with it |
 | Camera ID | the `(source, engine)` feed key — `gvsp` vs `ftp` |
 | Exposure, gain | `gvstat.txt` `exp_us`/`gain`, live only — **not persisted per frame or per run** |
 | Frame rate | `gvstat.txt` `fps`; `count_rate_hz` per series point |

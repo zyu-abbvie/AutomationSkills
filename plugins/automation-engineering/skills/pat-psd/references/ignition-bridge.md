@@ -113,9 +113,49 @@ METRICS = {
 }
 ```
 
-`PAT` is a plain input component labelled **"PAT Feed"**. `PSD_D50_um` is **hand-keyed**, and so are the
-three process parameters — **the real tag paths are commented out**, so even screw speed and feed rate
-are typed rather than read back from the extruder.
+`PAT` is a plain input component labelled **"PAT Feed"** (its label sibling is `enabled: false`). It has
+**no binding at all** and a hardcoded default:
+
+```json
+{"meta":{"name":"PAT"},"props":{"style":{…},"text":"12"},"type":"ia.input.text-area"}
+```
+
+So `PSD_D50_um` is not merely hand-keyed — **an untouched panel publishes `12` µm as a measurement**,
+which is plausible enough to survive review. Prod's `METRIC_TYPES` guard catches a `null`; it cannot
+catch a stale default.
+
+The three process parameters are read-only bindings off the **last BO trial**, not off the process:
+`ScrewSpeed` → `return value[-1]["screw_speed"]`, and likewise `L_s` and `SolidRate`. `FlowRate` is
+derived and disabled: `round(float(L_s) * float(SolidRate) * 1000/60, 3)`.
+
+### Two record paths, and the one that reads real tags mislabels a unit
+
+`Extruder-AP31-4-273_BO` has **both** buttons. `Record (Manual)` reads the text boxes with typed
+validation. `Record (Hardware)` reads tags — and is the only place `F1_Throughput` appears:
+
+```python
+PARAMS_APPLIED = {
+    "screw_speed":       "[default]GWF/_Process 11 UDP_/Tags/Extruder_Actual_Speed",
+    "liquid_solid_rate": "[MQTT Engine]LC/AP31/273-4/TSWG/Pump/AI/SP-01",
+    "solid_feed_rate":   "[default]GWF/_Process 11 UDP_/Tags/F1_Throughput",
+}
+```
+
+**`Pump/AI/SP-01` is a flow-rate setpoint in mL/min, published under a dimensionless liquid-to-solid
+*ratio* name.** The real ratio, `[default]GWF/L-SRatio`, exists **and is historised** — and BO never
+reads it. So even the hardware path trains the optimizer on the wrong quantity for its second decision
+variable.
+
+A second unit disagreement runs across the two halves: the design space says **Powder Feed Rate, g/min**,
+the UI labels the same field **Solid Rate (kg/hr)**, and the wire calls it `solid_feed_rate`. Nothing
+reconciles them.
+
+### Screw speed is never written back
+
+`"Push to Hardware"` pushes **liquid flow** (MQTT retained, to `…/TSWG/Pump/HMI_COM/SP-01`) and **solid
+feed rate** (OPC, the unverified `D11500`/`D11501` register pair). **Screw speed — decision variable
+number one — is never written at all.** An operator must set it by hand and trust that the value in the
+box matches the machine.
 
 Other literal labels in that view: **`"Record Exp(fake test)"`**, `"Start Optimizer"`, `"Stop
 Optimizer"`, `"Push to Hardware"`, `"Optimization Mode"`, `"Strady State Wait Time (min)"` [sic],
@@ -177,6 +217,19 @@ subscribe  [MQTT Engine]LC/AP31/273-4/BO/status/platform
 Full prod namespace, **all `String`**: `BO/{_probe, data, analysis/result, control/{analyze, constraints,
 hyperparameters, session, status, tagmap, trigger}, experiment/{history, result, suggestion},
 status/{platform, runtime}}` and `bay/{python, control/analyze, analysis/result}`.
+
+Control topics publish at **QoS 1**; `analysis/result` is retained and is cleared with an empty QoS-0
+retained publish before each new one. Liveness for the rig itself is
+`…/TSWG/Heartbeat.Timestamp`, with a comms-fault banner when it is more than **10 seconds** stale.
+
+**Mind the double slash.** `view.custom.projectPath` already ends in `/`, and the bindings concatenate
+another — so the real subscribed topics are `LC/AP31/273-4/BO//experiment/history` and, in
+`Bayesian_Platform`'s `side_window/bay` view, `…/BO//data`. They work only because both ends make the
+same mistake. Do not "fix" one end alone.
+
+**The external service is named `bo_platform`, and there is an LLM agent in front of the optimizer** —
+the analyze step turns a natural-language goal into a design space, and the code has an error path for
+*"Unexpected AI response - check the backend agent (LLM) is running."*
 
 **The library is Meta's Ax (BoTorch)**, stated outright in prod's `BO/code.py` (560 lines):
 
@@ -289,6 +342,69 @@ not be expected to.
 The vendors the knowledge pack lists as evaluated — **Parsum, Eyecon, Malvern, Sympatec, Insitec,
 Canty — have zero hits in either gateway.** None is integrated.
 
+## Which BO project is the live one
+
+Four projects carry BO code. Only one is current.
+
+| Project | Verdict |
+|---|---|
+| `Bayesian_Platform` (prod) | **current.** The only one with a real `BO/code.py` library — `to_py()`, blank-state handling, Ax constraint compilation, the `bo_projects` fallback chain |
+| `Extruder-AP31-4-273_BO` (prod) | **current**, and a **fork rather than an add-on**. It differs from `Extruder-AP31-4-273` in exactly four ways: it drops `parent: "FC_Parent"`, adds `fetch_projects`/`upsert_project`, removes the `InsertAnnotation` SFC, and grows `Page/BO` by the `Record (Manual)` button. Everything else is byte-identical |
+| `BO_Parent` (prod) | **superseded fork, not a template.** `inheritable: false`, no `parent`, and **nobody inherits it**. It is an earlier copy of the extruder project with the equipment pages deleted — four views left |
+| `Bayesian_Platform_Alpha` | **superseded prototype.** Zero `script-python`, so none of the library's fixes exist; prefix `…/bay` not `…/BO`; `parameter_type: "NUMERICAL"` not `"continuous"`; QoS 0 everywhere; and it calls **HTTP, not MQTT**, for analyze — prod's copy points at `10.246.116.144:80/analyze`, **a client workstation IP**, i.e. the agent was running on someone's laptop. It also contains the exact `del self.session.custom.bayesianOptimization` bug that `blank_state()` was written to fix |
+
+`Bayesian_Platform_Alpha` also exists on **dev**, where the `backendUrl` is a different host. Check which
+you are reading before quoting an address.
+
+## What is not wired, and where a PSD result could go
+
+**`ExpMetadata` is the estate's run-metadata system and it shares no key with the optimizer.** 166 files,
+27 views, **28 named queries — all `SELECT`**, with writes done inline via `runPrepUpdate` against
+`SQLServer`. Everything is keyed `(userid, expid, ver)` across `metadata`, `material`, `procvessel`,
+`procparam`, `samples`, `equipment`, `calculation`, `projandprocversion`. Its derived-quantity queries do
+real chemistry (mols from potency and molecular weight, equivalents normalised against the `Basis Charge`
+row, windowed cumulative mass and volume).
+
+**There is no `expid` or `sample_id` anywhere in the BO or Extruder projects, and no `bay_opt` /
+`bo_projects` reference in `ExpMetadata`.** BO traceability is `session_name` + `trial_index` inside MQTT
+JSON; ExpMetadata traceability is `(userid, expid, ver)` in SQL Server. **Nothing joins them**, so a PSD
+result cannot currently be attached to a recorded experiment.
+
+If you need to attach one today, the only hooks are:
+
+- **`calculation`** (`calc_name`, `calc_desc`, `calc_act`, `units`) — the closest fit; a `D50` row inserts
+  cleanly as a generic calculation.
+- **`metadata.process_tags`** — free text.
+- **`samples.sample_type`** — a hardcoded dropdown. Its `Inert` group is the **only** place `moisture`
+  appears anywhere in the estate, and it has **no PSD entry**.
+
+There is no numeric result or analytics table, and no `psd`/`d50` column anywhere in the schema.
+
+## `RecipeManager` does not cover the extruder
+
+79 files, 18 views, **0 named queries** (all SQL inline), and its one script resource `design/code.py` is
+**an empty file**. Recipes are a JSON blob in `Recipes.JSON`, versioned by `SELECT TOP 1 VERSION … ORDER
+BY VERSION DESC`.
+
+`Select Equipment` offers exactly **two** equipment types:
+
+- `Reactor` → `Dosing`, `HeatCool`, `Stir`, `Vaccum` [sic], `Wait`
+- `TFF` → `Fill`, `Filter`, `Filter with Makeup`, `DiaFiltration`, `Wait`
+
+**No extruder, no granulator, no dryer, no continuous-process step types.** The filter dryer consumes the
+same `Recipes` table and is therefore authored *as a Reactor recipe*. The extruder projects have **no
+recipe query, no `RecipeSelection` view and no `Recipe_Exec` SFC at all** — their only SFCs are
+`Collect_Fractions`, `TakeRunData` and `InsertAnnotation`, all inherited from the fraction-collector
+template. So a granulation run is not recipe-driven in Ignition today.
+
+## An adjacent unit worth knowing about
+
+**`WM_Parent1` / `WM_Parent` — a wet mill** at `[MQTT Engine]LC/R13/230-2-1/WetmillX01/{Actual Speed,
+Torque, Temperature}`, with a `Report/code.py` that pulls those three from the historian. It is the
+closest thing in the estate to a real wet-granulation size-reduction unit with torque instrumentation,
+and it is **not in the knowledge pack's chain diagram at all.** Both projects are near-stubs (19–25 files,
+~2 views each), so treat it as a lead rather than a working system.
+
 ## Projects whose names invite a wrong guess
 
 Checked, because each one looks like a link in the TSWG chain and is not:
@@ -363,8 +479,14 @@ deliberately.
    per run.
 7. **Give a run a Sample ID and a reference measurement.** Neither exists in `pat+gv` or in the estate,
    and the validation strategy in the knowledge pack is built on comparing against laser diffraction.
-8. **Do not describe the loop as closed** until `"Push to Hardware"` is commissioned. Its register
-   mapping and byte order are still marked as guesses.
+8. **Fix `liquid_solid_rate` while you are in there.** It is currently fed a flow setpoint in mL/min under
+   a dimensionless-ratio name, while the real `GWF/L-SRatio` sits historised and unread. A rig publishing
+   a correct D50 into a model trained on the wrong second variable is not an improvement.
+9. **Give the optimizer and `ExpMetadata` a shared key** — an `expid` on the BO side, or a `session_name`
+   column on the metadata side. Without one, no trial is reconstructable against its recorded experiment.
+10. **Do not describe the loop as closed** until `"Push to Hardware"` is commissioned and screw speed is
+    actually written. Its register mapping and byte order are still marked as guesses, and decision
+    variable number one is not pushed at all.
 
 Everything on the Ignition side of this is ordinary work covered by the other skills — `ignition-resources`
 for the tags and bindings, `mqtt-integration` for the topic layer and the retained-message rules,

@@ -13,7 +13,7 @@
       "name": "automation-engineering",
       "source": "./plugins/automation-engineering",
       "description": "Reference and toolkit for building, editing, interacting with and troubleshooting this estate's Ignition and Node-RED automation projects, the MQTT and SQL layers between them, and the edge PAT instruments that feed them.",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "category": "engineering",
       "keywords": [
         "ignition",
