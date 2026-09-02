@@ -212,3 +212,12 @@ second, newer publish path present on dev only.
 A duplicate client id makes the broker disconnect the older session, which presents as a flapping
 device. `mqtt-probe` generates a unique id per run. When configuring a real client, make the id
 identify the host and the purpose.
+
+## One publisher on this broker is not a groov RIO
+
+The PAT particle-sizing rig publishes under **`pat/psd/…`**, which does not follow the estate's
+`SITE/BUILDING/ROOM-BENCH/EQUIP/CATEGORY/POINT` namespace at all — it is a flat, instrument-owned tree
+with retained bare-float leaves (`…/d50`, `…/span`) beside JSON payloads, plus a QoS-1 retained
+`…/status` with a Last-Will. It also carries a per-reading **`valid`** flag that a consumer is required
+to honour by holding its last good output. Dev has two `pat/psd` tags provisioned and nothing reading
+them. See the `pat-psd` skill before binding anything to that tree.

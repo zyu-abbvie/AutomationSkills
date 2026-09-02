@@ -156,6 +156,7 @@ Two things to know:
 |---|---|
 | Anything on a **TFF** skid — the estate's most standardised platform, 20 benches | `tff-platform` |
 | Anything on a **mix** bench — LNP, and the LAI/MSP instances built on the same convention | `mix-system` |
+| The **in-line particle-sizing PAT rig** for twin-screw wet granulation, and the Bayesian optimizer it is meant to feed | `pat-psd` |
 | Author or edit views, scripts, named queries, tags, UDTs, SFCs | `ignition-resources` |
 | Drive a live gateway: API, MCP tools, scan, export/import | `ignition-gateway` |
 | Node-RED flows on groov RIO devices | `nodered-rio` |

@@ -3,7 +3,7 @@
   "name": "automation-engineering",
   "displayName": "Automation Engineering",
   "version": "1.0.0",
-  "description": "Working toolkit and local reference for this estate's automation projects: Ignition (Perspective, tags, UDTs, scripts, gateway resources, historian), Node-RED flows, and the MQTT + SQL layers that connect them. Includes live gateway and broker tooling, cross-platform triage playbooks, and the shared pitfall knowledge base.",
+  "description": "Working toolkit and local reference for this estate's automation projects: Ignition (Perspective, tags, UDTs, scripts, gateway resources, historian), Node-RED flows, the MQTT + SQL layers that connect them, and the edge PAT instruments that feed them - including the in-line particle-sizing rig for twin-screw wet granulation. Includes live gateway and broker tooling, cross-platform triage playbooks, and the shared pitfall knowledge base.",
   "keywords": [
     "ignition",
     "perspective",
@@ -14,7 +14,11 @@
     "lab-automation",
     "scada",
     "equipment-integration",
-    "troubleshooting"
+    "troubleshooting",
+    "pat",
+    "particle-size-distribution",
+    "bayesian-optimization",
+    "jetson"
   ],
   "author": {
     "name": "Lab Automation Engineering"

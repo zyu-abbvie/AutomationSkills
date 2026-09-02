@@ -8,6 +8,11 @@ Everything in here was verified against the live gateways, the live brokers and 
 backups on 2026-08-28 — not assembled from general Ignition documentation. Where a fact is
 environment-specific, the skill says which environment.
 
+The `pat-psd` skill was added on 2026-09-01 and covers a fourth kind of thing: an **edge PAT
+instrument** — the `pat+gv` particle-sizing rig on a Jetson AGX Thor. It was verified against that
+source tree and against both gateway backups, and it is explicit about the boundary between the two,
+because the rig is not yet connected to either gateway.
+
 ## Install
 
 ```
@@ -95,6 +100,7 @@ Then read the `estate-map` skill.
 | `estate-map` | Orientation. The two gateways, the architecture, the addressing scheme, where everything lives. Read first. |
 | `tff-platform` | Tangential Flow Filtration: the 20-bench platform, its 41-tag process model with units and physical meaning, the six SFC unit operations, the instruments, and how to debug a run. |
 | `mix-system` | Continuous mixing: the LNP benches and the LAI/MSP instances that reuse the convention, the ratio and dilution setpoint maths, the command contract, and the addressing traps. |
+| `pat-psd` | The in-line particle-sizing PAT rig for twin-screw wet granulation: the `pat+gv` codebase on the Jetson, its parity contract, the PSD statistics, the measurement invariants, and how it does and does not reach the Bayesian optimizer. |
 | `ignition-resources` | Authoring and editing views, scripts, named queries, tags, SFCs, inheritance — on disk. |
 | `ignition-gateway` | Driving a live gateway: HTTP API, MCP tools, logs, project scan, export/import. |
 | `nodered-rio` | Node-RED flows on the Opto 22 groov RIO edge devices. |

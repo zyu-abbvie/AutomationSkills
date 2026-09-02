@@ -23,14 +23,14 @@ exists, whether reads are anonymous, whether writes are authenticated, and which
 mounted. Run it before anything else.
 
 See [plugins/automation-engineering/README.md](plugins/automation-engineering/README.md) for
-configuration, the nine skills, and the seven bundled tools.
+configuration, the twelve skills, and the seven bundled tools.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
 | `.claude-plugin/marketplace.json` | The marketplace manifest. |
-| `plugins/automation-engineering/` | The plugin: 9 skills, 9 references, 7 tools, 1 review agent, 1 safety hook. |
+| `plugins/automation-engineering/` | The plugin: 12 skills, 23 references, 7 tools, 1 review agent, 1 safety hook. |
 | `automation.local.example.yaml` | Config template. Copy it, or generate a filled-in one with `bin/init-config`. |
 
 ## Not in this repository
@@ -66,6 +66,11 @@ on 2026-08-28 — not assembled from general Ignition documentation. The facts t
   MQTT-Engine tag typed `String`.
 - Commands are **not** tag writes — they are `system.cirruslink.engine.publish` calls, and a momentary
   command must clear its own retained message or it re-fires when the device reconnects.
+- The estate's **PAT instruments are not wired to its optimizers**. The twin-screw granulation line has
+  a real extruder, a real Ax/BoTorch Bayesian optimizer, and a real in-line particle-sizing rig — but the
+  PSD value the optimizer trains on is **typed into a text box by hand**, and the two `pat/psd` tags
+  provisioned to receive the rig's telemetry are referenced by nothing. `pat-psd` documents both ends and
+  what joining them requires.
 
 ## For maintainers
 
